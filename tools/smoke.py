@@ -60,6 +60,28 @@ def main() -> int:
     else:
         raise AssertionError("expected an unknown hash version to raise ValueError")
 
+    expected_schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False),
+            pa.field("name", pa.string(), nullable=True),
+            pa.field("score", pa.float64(), nullable=True),
+            pa.field("country", pa.string(), nullable=True),
+        ]
+    )
+    diff = witchhat.validate_schema(batch.schema, expected_schema)
+    assert diff.missing == ["country"], diff.missing
+    assert diff.is_breaking(), "a missing column must be breaking"
+
+    identical = witchhat.validate_schema(batch.schema, batch.schema)
+    assert identical.is_empty(), "a schema compared against itself must be empty"
+
+    narrower_expected = pa.schema([pa.field("id", pa.int32(), nullable=False)])
+    narrower_actual = pa.schema([pa.field("id", pa.int64(), nullable=False)])
+    assert not witchhat.validate_schema(narrower_actual, narrower_expected).is_empty()
+    assert witchhat.validate_schema(
+        narrower_actual, narrower_expected, allow_numeric_widening=True
+    ).is_empty()
+
     print("OK")
     return 0
 

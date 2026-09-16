@@ -1,9 +1,9 @@
 # witchhat
 
 Python library, implemented in Rust, of native data-transformation kernels aimed at
-Spark/Databricks workloads. Status: **composite hashing implemented end to end.** Schema
-validation, JSON normalization, regex cleanup, and the native transformations that would
-actually replace a Spark operation are not yet built.
+Spark/Databricks workloads. Status: **composite hashing and schema validation
+implemented end to end.** JSON normalization, regex cleanup, and the native
+transformations that would actually replace a Spark operation are not yet built.
 
 ## Goals / constraints (from the user, verbatim intent)
 
@@ -42,6 +42,7 @@ and maturin build config carried over.
 crates/witchhat-core/src/lib.rs      crate docs, #![forbid(unsafe_code)], #![warn(missing_docs)]
 crates/witchhat-core/src/schema.rs   re-exported Arrow schema types, schema_fingerprint
 crates/witchhat-core/src/hash.rs     HashVersion, hash_batch, hash_batch_all_columns, table_fingerprint
+crates/witchhat-core/src/validate.rs ValidateSchemaOptions, SchemaDiff, validate_schema
 crates/witchhat-core/src/cpu.rs      CpuFeatures, features()
 crates/witchhat-core/src/error.rs    Error, Result
 crates/witchhat-py/src/lib.rs        crate docs + pyo3 module shell (_witchhat)
@@ -125,9 +126,20 @@ holds across interpreters. No optional Cargo features exist yet (unlike pgdb's
 Resolved and shipped:
 
 - Composite row/table hashing (`hash.rs`), versioned, type-tagged, null- and
-  float-canonicalized. 11 Rust tests plus 6 doctests, all passing.
+  float-canonicalized.
+- Schema validation (`validate.rs`): `validate_schema` returns a `SchemaDiff`
+  (missing/unexpected/retyped/nullability-tightened columns) rather than a bare bool,
+  with opt-in numeric widening (narrower type, cross-signedness, and int-to-float are
+  never accepted regardless) and a `is_breaking()` vs. `is_empty()` distinction so
+  additive schema evolution does not count as a break. 20 Rust unit tests plus 7
+  doctests, all passing.
 - `schema_fingerprint`, `witchhat_core::cpu::features()`.
 - The `witchhat-py` mixed maturin layout (`python/witchhat/`), type stubs, `py.typed`.
+  `SchemaDiff.retyped` returns real `pyarrow.DataType` objects, not strings, via
+  `arrow`'s pyarrow bridge (`ToPyArrow` is implemented for `DataType`/`Field`/`Schema`/
+  `ArrayData`/`RecordBatch`, not for typed arrays; see `docs/architecture.md`
+  Chapter IX, Section 1 for the `PyArrowType: !Clone` workaround this required for a
+  `#[pyo3(get)]` field).
 - The wheel builds (`maturin build --release`) and was verified against a real
   `pyarrow.RecordBatch` (`tools/smoke.py`), not just the Rust unit tests.
 - Full rustdoc on every public `witchhat-core` item; `cargo doc --no-deps -D warnings`
@@ -137,7 +149,6 @@ Resolved and shipped:
 
 Still open:
 
-- Schema validation against an expected shape (not just fingerprinting one).
 - JSON normalization and a regex-heavy cleanup kernel.
 - An output-equivalence test harness built on `table_fingerprint` plus per-column
   diffing, for asserting a witchhat pipeline and its Spark equivalent agree in CI.

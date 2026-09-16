@@ -4,7 +4,7 @@
 **Status** Partial by necessity: witchhat is a stateless transformation library today, with no write path, no job to schedule, and no storage of its own. This document covers what already applies (build, install, sizing) and defers what does not yet (Chapter VI).
 **Audience** Whoever builds the wheel and installs it on a Databricks workspace.
 **Companion documents** `architecture.md` for the design, `api.md` for the callable surface.
-**Version** 1.0
+**Version** 1.1
 **Date** 2026-09-16
 
 ---
@@ -26,6 +26,7 @@
   - 1. What scales and what does not
   - 2. Memory
   - 3. Cores
+  - 4. Schema validation is a different shape
 - V. Failure Modes
   - 1. Exceptions and what they mean
   - 2. What cannot fail
@@ -145,7 +146,14 @@ Every kernel runs on the calling thread; nothing here uses multiple cores yet. O
 Databricks driver or worker, parallelism today comes from calling witchhat once per Spark
 partition (e.g. from a `mapInArrow`/Pandas UDF), not from anything internal to the
 library. A future kernel expensive enough to justify releasing the GIL (`architecture.md`
-Chapter V) would also be a candidate for internal parallelism; neither exists yet.
+Chapter VI) would also be a candidate for internal parallelism; neither exists yet.
+
+### 4. Schema validation is a different shape
+
+`validate_schema` is O(fields), not O(rows): it never touches the data in a batch, only
+its schema. Cost is negligible relative to any hashing or future transformation kernel,
+so it is cheap enough to run on every batch as a pre-flight check rather than sampled or
+skipped for performance reasons.
 
 ## V. Failure Modes
 
@@ -158,6 +166,11 @@ Chapter V) would also be a candidate for internal parallelism; neither exists ye
 | `ValueError: unknown hash version ...` | A typo in `version`, or code written against a version this build does not implement | Check `witchhat.__version__` and this build's supported versions |
 | `RuntimeError: column "..." not found in schema` | A column name mismatch, often from a schema that drifted upstream | Compare the caller's expected columns against `batch.schema` |
 | `RuntimeError: unsupported arrow type for this operation: ...` | A column of a type Table 3-2 in `architecture.md` does not list | Cast the column, or wait for that type to be added |
+
+`validate_schema` is not in this table: a schema mismatch is a normal `SchemaDiff`
+return value, never an exception. If a caller wants a mismatch to fail loudly, that is
+their own `if diff.is_breaking(): raise ...`, not something witchhat raises for them
+(see `docs/api.md` Section V.3 for the pattern).
 
 ### 2. What cannot fail
 

@@ -47,6 +47,11 @@ table_fp = witchhat.table_fingerprint(witchhat.hash_rows_all_columns(batch))
 
 witchhat.schema_fingerprint(batch.schema)
 witchhat.cpu_features()
+
+# compare an incoming batch's schema against what a pipeline expects
+diff = witchhat.validate_schema(batch.schema, expected_schema)
+if diff.is_breaking():
+    raise ValueError(f"schema mismatch: {diff!r}")
 ```
 
 `batch` can be anything that implements the Arrow C Data / pyarrow interface
@@ -88,30 +93,34 @@ whole batch of row hashes into one order-independent value with a
 commutative combiner, so verifying witchhat's output against Spark's does
 not require either side to sort first.
 
+**Schema validation reports a diff, not a bool.** [`validate_schema`] compares
+an actual schema against an expected one and returns exactly what differs
+(missing, unexpected, retyped, or nullability-tightened columns), so a caller
+can distinguish a breaking change from additive schema evolution instead of
+being told only "matches" or "doesn't". See
+[`crates/witchhat-core/src/validate.rs`](crates/witchhat-core/src/validate.rs).
+
 ## Not built yet
 
-The core data model and composite row hashing are done. Ordered by what
-the stated goal needs next:
+The core data model, composite row hashing, and schema validation are done.
+Ordered by what the stated goal needs next:
 
-1. **Schema validation.** Check a batch against an expected `Schema`
-   (type coercion rules, nullable mismatches, missing/extra columns) rather
-   than just fingerprinting it.
-2. **JSON normalization.** Flatten/normalize nested JSON columns into a
+1. **JSON normalization.** Flatten/normalize nested JSON columns into a
    fixed Arrow schema, the usual first step before anything else in the
    pipeline can run.
-3. **Regex-heavy cleanup.** A transform kernel for the regex-based
+2. **Regex-heavy cleanup.** A transform kernel for the regex-based
    normalization rules that currently live in Spark UDFs, with the same
    versioning discipline as hashing.
-4. **Output equivalence testing.** A harness built on `table_fingerprint`
+3. **Output equivalence testing.** A harness built on `table_fingerprint`
    plus per-column diffing, so a witchhat pipeline and its Spark equivalent
    can be asserted equal in CI.
-5. **Native transformations.** The actual replacements for Spark operations
+4. **Native transformations.** The actual replacements for Spark operations
    (filter/project/join/aggregate paths), the point of the exercise.
-6. **Reproducible-build check.** manylinux abi3 wheel build + CI are done (see
+5. **Reproducible-build check.** manylinux abi3 wheel build + CI are done (see
    `.github/workflows/ci.yml`); still need a same-inputs -> byte-identical-wheel check.
-7. **Publish to a package repository.** Currently wheel-only, no index; see
+6. **Publish to a package repository.** Currently wheel-only, no index; see
    `docs/operations.md` Chapter III.
-8. **Databricks Volumes distribution.** Confirm `pip install` from a Unity
+7. **Databricks Volumes distribution.** Confirm `pip install` from a Unity
    Catalog volume path works with the abi3 wheel as built (documented as the intended
    path in `docs/operations.md`, not yet verified against a real workspace).
 
@@ -124,10 +133,12 @@ Type hints and generated docs (`.pyi` stubs, `py.typed`, `docs/*.md` + generated
 cargo test --workspace
 ```
 
-11 unit tests plus 6 doctests, all in `witchhat-core`: hash determinism, column-order
+20 unit tests plus 7 doctests, all in `witchhat-core`: hash determinism, column-order
 sensitivity, null-vs-value distinctness, type-tag collision avoidance, float
 canonicalization (NaN, -0.0), unknown-column errors, order-independent table
-fingerprints, and schema-fingerprint sensitivity to field order/type/nullability.
+fingerprints, schema-fingerprint sensitivity to field order/type/nullability, and
+schema-diff correctness (missing/unexpected/retyped/nullability, numeric widening
+opt-in, narrowing and cross-signedness always rejected).
 `cargo doc --no-deps -p witchhat-core` and `cargo clippy --workspace --all-targets`
 both run clean with warnings denied (`missing_docs`, `broken_intra_doc_links`, clippy's
 default lint set); see `.github/workflows/ci.yml`.

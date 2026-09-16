@@ -18,7 +18,7 @@ use arrow_data::ArrayData;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
-use witchhat_core::HashVersion;
+use witchhat_core::{DataType, HashVersion, ValidateSchemaOptions};
 
 fn parse_version(version: &str) -> PyResult<HashVersion> {
     HashVersion::parse(version)
@@ -97,6 +97,110 @@ fn schema_fingerprint(schema: PyArrowType<witchhat_core::Schema>, version: &str)
     Ok(witchhat_core::schema_fingerprint(&schema.0, version))
 }
 
+/// The result of comparing an actual schema against an expected one.
+///
+/// Empty (`is_empty()`) when the two agree. Not constructible directly; returned by
+/// `validate_schema`.
+#[pyclass(name = "SchemaDiff")]
+struct PySchemaDiff {
+    /// Column names in `expected` that `actual` does not have.
+    #[pyo3(get)]
+    missing: Vec<String>,
+    /// Column names in `actual` that `expected` does not have. Reported, but does not
+    /// make `is_breaking()` true: an additive column does not usually invalidate code
+    /// written against the narrower, expected schema.
+    #[pyo3(get)]
+    unexpected: Vec<String>,
+    /// `(column, expected_type, actual_type)` for every column present in both schemas
+    /// whose type differs and was not an accepted widening.
+    ///
+    /// Exposed via a hand-written `#[getter]` below rather than `#[pyo3(get)]`, since
+    /// `PyArrowType` does not implement `Clone` and `#[pyo3(get)]` needs to clone a
+    /// field to return it; the getter builds a fresh `PyArrowType` from the plain,
+    /// `Clone`-able `DataType` stored here instead.
+    retyped: Vec<(String, DataType, DataType)>,
+    /// `(column, expected_nullable, actual_nullable)` for every column whose
+    /// nullability tightened.
+    #[pyo3(get)]
+    nullability: Vec<(String, bool, bool)>,
+}
+
+#[pymethods]
+impl PySchemaDiff {
+    #[getter]
+    fn retyped(&self) -> Vec<(String, PyArrowType<DataType>, PyArrowType<DataType>)> {
+        self.retyped
+            .iter()
+            .map(|(column, expected, actual)| {
+                (
+                    column.clone(),
+                    PyArrowType(expected.clone()),
+                    PyArrowType(actual.clone()),
+                )
+            })
+            .collect()
+    }
+
+    /// Whether `actual` and `expected` agreed on every point checked.
+    fn is_empty(&self) -> bool {
+        self.missing.is_empty()
+            && self.unexpected.is_empty()
+            && self.retyped.is_empty()
+            && self.nullability.is_empty()
+    }
+
+    /// Whether the difference is one a caller most likely cannot safely ignore: a
+    /// missing column, a retyped column, or a nullability tightening. An `unexpected`
+    /// column alone does not count.
+    fn is_breaking(&self) -> bool {
+        !self.missing.is_empty() || !self.retyped.is_empty() || !self.nullability.is_empty()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "SchemaDiff(missing={:?}, unexpected={:?}, retyped={} column(s), nullability={} column(s))",
+            self.missing,
+            self.unexpected,
+            self.retyped.len(),
+            self.nullability.len()
+        )
+    }
+}
+
+/// Compares `actual` against `expected` and returns their difference.
+///
+/// Columns are matched by name, case-sensitively. `allow_numeric_widening` (default
+/// `False`) accepts `actual` having a wider numeric type than `expected` for the same
+/// column (`int32` -> `int64`, `float32` -> `float64`, and so on within a signedness
+/// class); a narrower type, a cross-signedness change, or an integer-to-float change is
+/// never accepted regardless. See `witchhat.SchemaDiff` for the returned shape.
+#[pyfunction]
+#[pyo3(signature = (actual, expected, allow_numeric_widening = false))]
+fn validate_schema(
+    actual: PyArrowType<witchhat_core::Schema>,
+    expected: PyArrowType<witchhat_core::Schema>,
+    allow_numeric_widening: bool,
+) -> PySchemaDiff {
+    let options = ValidateSchemaOptions {
+        allow_numeric_widening,
+    };
+    let diff = witchhat_core::validate_schema(&actual.0, &expected.0, options);
+    PySchemaDiff {
+        missing: diff.missing.iter().map(ToString::to_string).collect(),
+        unexpected: diff.unexpected.iter().map(ToString::to_string).collect(),
+        retyped: diff
+            .retyped
+            .into_iter()
+            .map(|r| (r.column.to_string(), r.expected, r.actual))
+            .collect(),
+        nullability: diff
+            .nullability
+            .into_iter()
+            .map(|n| (n.column.to_string(), n.expected_nullable, n.actual_nullable))
+            .collect(),
+    }
+}
+
 /// CPU features detected on the machine running this process.
 ///
 /// Informational only: nothing in this release branches on it. It exists so a future
@@ -144,10 +248,12 @@ fn cpu_features() -> PyCpuFeatures {
 /// Registers everything the extension module exposes.
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyCpuFeatures>()?;
+    module.add_class::<PySchemaDiff>()?;
     module.add_function(wrap_pyfunction!(hash_rows, module)?)?;
     module.add_function(wrap_pyfunction!(hash_rows_all_columns, module)?)?;
     module.add_function(wrap_pyfunction!(table_fingerprint, module)?)?;
     module.add_function(wrap_pyfunction!(schema_fingerprint, module)?)?;
+    module.add_function(wrap_pyfunction!(validate_schema, module)?)?;
     module.add_function(wrap_pyfunction!(cpu_features, module)?)?;
     Ok(())
 }

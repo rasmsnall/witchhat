@@ -11,6 +11,7 @@
 //!
 //! - [`schema`]: re-exports of the canonical Arrow schema types, plus [`schema_fingerprint`].
 //! - [`hash`]: versioned composite row and table hashing.
+//! - [`validate`]: comparing an actual schema against an expected one.
 //! - [`cpu`]: runtime CPU feature detection for future SIMD dispatch.
 //! - [`error`]: the crate's error type.
 //!
@@ -25,8 +26,12 @@ pub mod cpu;
 pub mod error;
 pub mod hash;
 pub mod schema;
+pub mod validate;
 
 pub use cpu::{CpuFeatures, features};
 pub use error::{Error, Result};
 pub use hash::{HashVersion, hash_batch, hash_batch_all_columns, table_fingerprint};
 pub use schema::{DataType, Field, Fields, Schema, SchemaRef, schema_fingerprint};
+pub use validate::{
+    NullabilityChange, RetypedColumn, SchemaDiff, ValidateSchemaOptions, validate_schema,
+};

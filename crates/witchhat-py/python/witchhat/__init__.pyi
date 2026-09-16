@@ -161,6 +161,74 @@ def schema_fingerprint(
         ``version`` does not name a known hashing algorithm.
     """
 
+class SchemaDiff:
+    """The result of comparing an actual schema against an expected one.
+
+    Empty (:meth:`is_empty`) when the two agree under the ``allow_numeric_widening``
+    passed to :func:`validate_schema`. Not constructible directly.
+    """
+
+    @property
+    def missing(self) -> list[str]:
+        """Column names in ``expected`` that ``actual`` does not have."""
+
+    @property
+    def unexpected(self) -> list[str]:
+        """Column names in ``actual`` that ``expected`` does not have.
+
+        Reported, but does not make :meth:`is_breaking` true: an additive column does
+        not usually invalidate code written against the narrower, expected schema.
+        """
+
+    @property
+    def retyped(self) -> list[tuple[str, "pa.DataType", "pa.DataType"]]:
+        """``(column, expected_type, actual_type)`` for every column present in both
+        schemas whose type differs and was not an accepted widening."""
+
+    @property
+    def nullability(self) -> list[tuple[str, bool, bool]]:
+        """``(column, expected_nullable, actual_nullable)`` for every column whose
+        nullability tightened (``expected`` non-nullable, ``actual`` nullable)."""
+
+    def is_empty(self) -> bool:
+        """Whether ``actual`` and ``expected`` agreed on every point checked."""
+
+    def is_breaking(self) -> bool:
+        """Whether the difference is one a caller most likely cannot safely ignore: a
+        missing column, a retyped column, or a nullability tightening. An
+        :attr:`unexpected` column alone does not count."""
+
+def validate_schema(
+    actual: _ArrowSchemaExportable,
+    expected: _ArrowSchemaExportable,
+    allow_numeric_widening: bool = False,
+) -> SchemaDiff:
+    """Compare ``actual`` against ``expected`` and return their difference.
+
+    Columns are matched by name, case-sensitively. For a column present in both: its
+    type must match exactly unless ``allow_numeric_widening`` accepts the specific
+    widening seen (``int32`` -> ``int64``, ``float32`` -> ``float64``, and so on within
+    a signedness class; a narrower type, a cross-signedness change, or an
+    integer-to-float change is never accepted regardless), and ``actual``'s nullability
+    must be compatible with ``expected``'s: nullable is fine when ``expected`` is too,
+    or non-nullable when ``expected`` allows null, but not nullable when ``expected``
+    declares the column non-nullable.
+
+    Parameters
+    ----------
+    actual:
+        The schema to check, such as a ``pyarrow.RecordBatch``'s ``.schema``.
+    expected:
+        The schema ``actual`` is being checked against.
+    allow_numeric_widening:
+        Accept ``actual`` having a wider numeric type than ``expected`` for the same
+        column. ``False`` by default (exact type match required).
+
+    Returns
+    -------
+    SchemaDiff
+    """
+
 def cpu_features() -> CpuFeatures:
     """Detect the CPU features of the machine running this process.
 
