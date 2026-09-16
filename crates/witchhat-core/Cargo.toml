@@ -1,0 +1,12 @@
+[package]
+name = "witchhat-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+thiserror = { workspace = true }
+xxhash-rust = { workspace = true }

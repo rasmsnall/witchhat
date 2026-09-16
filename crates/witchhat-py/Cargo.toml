@@ -1,0 +1,19 @@
+[package]
+name = "witchhat-py"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "witchhat"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+arrow = { version = "56", default-features = false, features = ["pyarrow"] }
+arrow-array = { workspace = true }
+arrow-data = "56"
+# pinned to match arrow's `pyarrow` feature, which links pyo3-ffi and only
+# tolerates one exact version across the whole dependency graph
+pyo3 = { version = "=0.25.1", features = ["extension-module", "abi3-py310"] }
+witchhat-core = { workspace = true }
