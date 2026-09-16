@@ -1,9 +1,10 @@
 # witchhat
 
 Python library, implemented in Rust, of native data-transformation kernels aimed at
-Spark/Databricks workloads. Status: **composite hashing and schema validation
-implemented end to end.** JSON normalization, regex cleanup, and the native
-transformations that would actually replace a Spark operation are not yet built.
+Spark/Databricks workloads. Status: **six kernels implemented end to end** (composite
+hashing, schema validation, JSON normalization, regex cleanup, output-equivalence
+testing, deduplication). Join and aggregate, the relational operations that would make
+"native transformations" a real Spark replacement, are not yet built.
 
 ## Goals / constraints (from the user, verbatim intent)
 
@@ -17,14 +18,16 @@ transformations that would actually replace a Spark operation are not yet built.
   single source of truth, Word (`.docx`) generated from it via `tools/md2docx.py`, and
   full rustdoc (`missing_docs` denied) on every public Rust item.
 - Versioned transformation behaviour: an algorithm, once shipped under a name, never
-  changes what it produces. See `HashVersion` in `crates/witchhat-core/src/hash.rs`.
+  changes what it produces. Applies per kernel: `HashVersion` (hashing), `NormalizeVersion`
+  (JSON), `CleanupVersion` (named cleanup presets only, never a caller's own regex).
 - CPU feature detection with a portable fallback, and the stronger constraint that
   follows from it: a SIMD-accelerated path may change speed, never output. See
-  `crates/witchhat-core/src/cpu.rs` and `docs/architecture.md` Chapter IV.
+  `crates/witchhat-core/src/cpu.rs` and `docs/architecture.md` Chapter IX.
 - Wheels usable from Databricks Volumes or a package repository; reproducible builds.
-- Generic framework for: composite hashing (done), schema validation, JSON
-  normalization, regex-heavy cleanup, output-equivalence testing, and native
-  transformations, with the eventual goal of replacing Spark operations outright.
+- Generic framework for: composite hashing, schema validation, JSON normalization,
+  regex-heavy cleanup, output-equivalence testing (all done), and native transformations
+  (deduplication done; join/aggregate open), with the eventual goal of replacing Spark
+  operations outright.
 
 ## Pivot history
 
@@ -39,49 +42,60 @@ and maturin build config carried over.
 ## Layout
 
 ```
-crates/witchhat-core/src/lib.rs      crate docs, #![forbid(unsafe_code)], #![warn(missing_docs)]
-crates/witchhat-core/src/schema.rs   re-exported Arrow schema types, schema_fingerprint
-crates/witchhat-core/src/hash.rs     HashVersion, hash_batch, hash_batch_all_columns, table_fingerprint
-crates/witchhat-core/src/validate.rs ValidateSchemaOptions, SchemaDiff, validate_schema
-crates/witchhat-core/src/cpu.rs      CpuFeatures, features()
-crates/witchhat-core/src/error.rs    Error, Result
-crates/witchhat-py/src/lib.rs        crate docs + pyo3 module shell (_witchhat)
-crates/witchhat-py/src/python.rs     the actual pyo3 bindings (register())
+crates/witchhat-core/src/lib.rs        crate docs, #![forbid(unsafe_code)], #![warn(missing_docs)]
+crates/witchhat-core/src/schema.rs     re-exported Arrow schema types, schema_fingerprint
+crates/witchhat-core/src/hash.rs       HashVersion, hash_batch, hash_batch_all_columns, table_fingerprint
+crates/witchhat-core/src/validate.rs   ValidateSchemaOptions, SchemaDiff, validate_schema
+crates/witchhat-core/src/json.rs       NormalizeVersion, NormalizeStats, normalize_json
+crates/witchhat-core/src/clean.rs      CleanRule, CleanupVersion, apply_rules, preset, clean_with_preset
+crates/witchhat-core/src/equivalence.rs EquivalenceOptions, EquivalenceReport, check_equivalence
+crates/witchhat-core/src/dedup.rs      drop_duplicates (first native transformation)
+crates/witchhat-core/src/cpu.rs        CpuFeatures, features()
+crates/witchhat-core/src/error.rs      Error, Result
+crates/witchhat-py/src/lib.rs          crate docs + pyo3 module shell (_witchhat)
+crates/witchhat-py/src/python.rs       the actual pyo3 bindings (register())
 crates/witchhat-py/python/witchhat/__init__.py    re-exports _witchhat, __all__, __version__
 crates/witchhat-py/python/witchhat/__init__.pyi   type stubs, one docstring per export
 crates/witchhat-py/python/witchhat/py.typed
-crates/witchhat-py/pyproject.toml    maturin config (abi3-py310, mixed layout)
+crates/witchhat-py/pyproject.toml      maturin config (abi3-py310, mixed layout)
 rust-toolchain.toml   pins rustc/rustfmt/clippy to one version
 README.md
 docs/architecture.md
 docs/api.md
 docs/operations.md
 tools/md2docx.py      generates docs/*.docx from docs/*.md
-tools/smoke.py        round-trips a real pyarrow batch through the built wheel
+tools/smoke.py        round-trips a real pyarrow batch through the built wheel, every function
 .github/workflows/ci.yml   fmt+clippy+test+doc job, manylinux abi3 wheel job, multi-interpreter matrix
 ```
 
 Two-crate split (`witchhat-core` has no PyO3 dependency; `witchhat-py` is a thin
 translation layer over it), unlike `rust-streamer-pgdb`'s single-crate layout. Deliberate
 here: a future Rust-only consumer links `witchhat-core` without pulling in `pyo3` at all.
-See `docs/architecture.md` Chapter VIII for the full rationale, including why
+See `docs/architecture.md` Chapter XIII for the full rationale, including why
 `witchhat-py` pins `pyo3 = "=0.25.1"` exactly (arrow's `pyarrow` Cargo feature links
 `pyo3-ffi` and tolerates only one exact version across the dependency graph; bumping pyo3
-later needs arrow to catch up first, not just an edited version string).
+later needs arrow to catch up first, not just an edited version string) and why every
+typed array crosses the PyO3 boundary via `ArrayData` (`u64_array_*`/`string_array_*`
+helpers in `python.rs`) since `PyArrowType<T>` isn't `Clone` and arrow's pyarrow bridge
+doesn't implement `ToPyArrow`/`FromPyArrow` for typed arrays directly.
 
 ## Dependency budget
 
 | Crate | Why |
 |---|---|
 | `arrow-array`, `arrow-schema` | The data model. `witchhat-core` depends on these only, no pyo3 |
+| `arrow-select` | `filter_record_batch`, underlying `drop_duplicates` |
 | `arrow-data` | `ArrayData`, the untyped array arrow's pyarrow bridge actually converts (witchhat-py only) |
 | `arrow` (feature `pyarrow`) | Zero-copy `RecordBatch`/`ArrayData` <-> pyarrow conversion (witchhat-py only) |
 | `xxhash-rust` (feature `xxh3`) | Per-value hash function underlying `hash_batch` |
+| `serde_json` | JSON parsing for `normalize_json` |
+| `regex` | Pattern compilation/replacement for `clean` |
 | `thiserror` | The `Error` enum |
 | `pyo3` | Python bindings (witchhat-py only); pinned to `=0.25.1`, see above |
 
 Pinned 2026-09 (probed via `cargo build`; crates.io index reachable): `arrow 56.2.1`,
-`xxhash-rust 0.8.18`, `thiserror 2.0.20`, `pyo3 0.25.1`.
+`xxhash-rust 0.8.18`, `serde_json 1.0.151`, `regex 1.13.1`, `thiserror 2.0.20`,
+`pyo3 0.25.1`.
 
 ## Documentation standard
 
@@ -108,9 +122,12 @@ Same standard as `rust-streamer-pgdb`, adopted 2026-09-16 at the user's request:
 
 | Document | Contents |
 |---|---|
-| `docs/architecture.md` | Data model, hashing design, versioning/CPU-feature discipline, concurrency/failure/security model, dependency budget, what's not built yet |
-| `docs/api.md` | Python and Rust surface, parameter semantics |
-| `docs/operations.md` | Building and installing the wheel, sizing, what a conventional ops manual would cover but does not apply yet (no write path, no job to schedule) |
+| `docs/architecture.md` | Data model, per-kernel design (Chapters III-VIII), versioning/CPU-feature discipline, concurrency/failure/security model, dependency budget, what's not built yet |
+| `docs/api.md` | Python and Rust surface, parameter semantics, worked examples |
+| `docs/operations.md` | Building and installing the wheel, sizing per kernel, what's deferred because unbuilt vs. deferred pending access this environment lacks (Chapter VI) |
+
+Chapter numbers shift as kernels are added; always check the Contents section of the
+`.md` file itself rather than trusting a remembered chapter number from an old session.
 
 ## CI
 
@@ -127,36 +144,57 @@ Resolved and shipped:
 
 - Composite row/table hashing (`hash.rs`), versioned, type-tagged, null- and
   float-canonicalized.
-- Schema validation (`validate.rs`): `validate_schema` returns a `SchemaDiff`
-  (missing/unexpected/retyped/nullability-tightened columns) rather than a bare bool,
-  with opt-in numeric widening (narrower type, cross-signedness, and int-to-float are
-  never accepted regardless) and a `is_breaking()` vs. `is_empty()` distinction so
-  additive schema evolution does not count as a break. 20 Rust unit tests plus 7
-  doctests, all passing.
+- Schema validation (`validate.rs`): `SchemaDiff` (missing/unexpected/retyped/
+  nullability-tightened), opt-in conservative numeric widening,
+  `is_breaking()`/`is_empty()`.
+- JSON normalization (`json.rs`): `normalize_json` parses one JSON object per row into a
+  flat/one-level-dotted-path target schema (`utf8`/`int64`/`float64`/`boolean` only);
+  `NormalizeStats` distinguishes malformed rows (counted) from absent/explicit-null
+  (ordinary, uncounted) from wrong-type-present (counted per column). Nested objects
+  beyond one level and arrays are not supported (fall into the type-mismatch case).
+- Regex cleanup (`clean.rs`): `apply_rules` for caller-supplied rules (unversioned, since
+  they're the caller's own algorithm), `preset`/`clean_with_preset` for five named,
+  versioned built-ins (`trim_whitespace`, `collapse_whitespace`,
+  `strip_control_characters`, `strip_non_alphanumeric`, `digits_only`).
+- Output equivalence testing (`equivalence.rs`): `check_equivalence` combines
+  `validate_schema` + `table_fingerprint` over a column order shared between both sides
+  (so declared column order alone doesn't cause a false mismatch); `is_equivalent()` is
+  deliberately stricter than `SchemaDiff::is_breaking()` (an extra column fails it).
+- Deduplication (`dedup.rs`): `drop_duplicates`, the first native transformation
+  (Spark's `dropDuplicates`), reusing `hash_batch` as the dedup key plus
+  `arrow_select::filter::filter_record_batch`. Filter/project were deliberately *not*
+  wrapped: Arrow's own kernels already do the job.
 - `schema_fingerprint`, `witchhat_core::cpu::features()`.
-- The `witchhat-py` mixed maturin layout (`python/witchhat/`), type stubs, `py.typed`.
-  `SchemaDiff.retyped` returns real `pyarrow.DataType` objects, not strings, via
-  `arrow`'s pyarrow bridge (`ToPyArrow` is implemented for `DataType`/`Field`/`Schema`/
-  `ArrayData`/`RecordBatch`, not for typed arrays; see `docs/architecture.md`
-  Chapter IX, Section 1 for the `PyArrowType: !Clone` workaround this required for a
-  `#[pyo3(get)]` field).
+- The `witchhat-py` mixed maturin layout (`python/witchhat/`), type stubs, `py.typed`,
+  full Python bindings for every kernel above (`SchemaDiff.retyped` and
+  `EquivalenceReport.schema_diff` both return/nest real `pyarrow.DataType`/`SchemaDiff`
+  objects, not strings/dicts).
 - The wheel builds (`maturin build --release`) and was verified against a real
-  `pyarrow.RecordBatch` (`tools/smoke.py`), not just the Rust unit tests.
+  `pyarrow.RecordBatch` (`tools/smoke.py` exercises every exported function), not just
+  the Rust unit tests.
 - Full rustdoc on every public `witchhat-core` item; `cargo doc --no-deps -D warnings`
-  and `cargo clippy --all-targets -- -D warnings` both clean.
+  and `cargo clippy --all-targets -- -D warnings` both clean. 49 Rust unit tests plus 12
+  doctests, all passing.
 - `rust-toolchain.toml` pinned; CI and docs/CI conventions adopted from
   `rust-streamer-pgdb`.
 
 Still open:
 
-- JSON normalization and a regex-heavy cleanup kernel.
-- An output-equivalence test harness built on `table_fingerprint` plus per-column
-  diffing, for asserting a witchhat pipeline and its Spark equivalent agree in CI.
-- The native transformations (filter/project/join/aggregate) that are the actual point:
-  everything so far is supporting infrastructure for them.
-- Publishing to a package repository (currently wheel-only, no index).
+- Join and aggregate: the two relational operations that would make "native
+  transformations" a real Spark replacement rather than supporting infrastructure.
+- Publishing to a package repository. **Blocked on the user, not on more code**: needs a
+  PyPI (or internal index) account and an upload credential this repository's automation
+  does not hold. A package upload is one-way (cannot be un-published, only yanked), so
+  this should not be attempted without the user explicitly providing credentials and
+  confirming the target index. See `docs/operations.md` Chapter VI, Section 2.
+- Verifying installation from a Databricks Unity Catalog Volume against a real
+  workspace. **Blocked on the user, not on more code**: this development environment has
+  no Databricks workspace to test against. The `/Volumes/...` install procedure is
+  documented in `docs/operations.md` Chapter III as the intended path, but unconfirmed.
 - Whether/when a kernel becomes expensive enough to justify releasing the GIL
-  (`docs/architecture.md` Chapter V); none does yet.
+  (`docs/architecture.md` Chapter X); none does yet, though JSON normalization and regex
+  cleanup are the most CPU-intensive kernels so far per input byte (`docs/operations.md`
+  Chapter IV, Section 5).
 
 ## Environment notes
 
@@ -164,3 +202,6 @@ Still open:
   python-docx 1.2.0.
 - `cargo fmt --all` reformats aggressively; run it after any hand-edit to `.rs` files
   before committing, since CI checks `cargo fmt --all --check`.
+- No `gh` CLI in this environment (neither Git Bash nor PowerShell `PATH`). Pushing to
+  GitHub uses `git push` directly against an `origin` remote the user creates and shares
+  the URL/name for; this session cannot create a GitHub repo itself.

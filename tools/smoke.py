@@ -82,6 +82,43 @@ def main() -> int:
         narrower_actual, narrower_expected, allow_numeric_widening=True
     ).is_empty()
 
+    json_col = pa.array(
+        [
+            '{"id": 1, "address": {"city": "Oslo"}}',
+            '{"id": 2}',
+            "not json",
+        ]
+    )
+    json_schema = pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field("address.city", pa.string()),
+        ]
+    )
+    normalized, stats = witchhat.normalize_json(json_col, json_schema)
+    assert normalized.num_rows == 3
+    assert stats.rows_malformed == 1, stats
+    assert normalized.column("address.city")[0].as_py() == "Oslo"
+
+    messy = pa.array(["  Hello   World  ", None])
+    cleaned = witchhat.clean_with_preset(messy, "collapse_whitespace")
+    assert cleaned[0].as_py() == " Hello World ", cleaned
+    trimmed = witchhat.clean_with_preset(cleaned, "trim_whitespace")
+    assert trimmed[0].as_py() == "Hello World"
+    assert trimmed[1].as_py() is None
+
+    custom = witchhat.clean_with_rules(pa.array(["foo123bar"]), [(r"[0-9]+", "-")])
+    assert custom[0].as_py() == "foo-bar"
+
+    report = witchhat.check_equivalence(reordered, batch)
+    assert report.is_equivalent(), report
+    different = witchhat.check_equivalence(batch, pa.record_batch({"id": pa.array([9])}))
+    assert not different.is_equivalent()
+
+    dup_batch = pa.record_batch({"id": pa.array([1, 2, 1, 3, 2])})
+    deduped = witchhat.drop_duplicates(dup_batch, ["id"])
+    assert deduped.column("id").to_pylist() == [1, 2, 3]
+
     print("OK")
     return 0
 

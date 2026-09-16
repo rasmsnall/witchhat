@@ -1,10 +1,10 @@
 # witchhat: Architecture
 
 **Document type** Technical architecture specification
-**Status** Partial. Two kernels (composite hashing, schema validation) are implemented end to end, behind both the Rust and the Python surface. JSON normalization, regex cleanup, and native transformations are not yet built; see Chapter XII for what that means for this document.
+**Status** Partial. Six kernels (composite hashing, schema validation, JSON normalization, regex cleanup, output-equivalence testing, deduplication) are implemented end to end, behind both the Rust and the Python surface. The rest of "native transformations" (filter/project/join/aggregate) is not yet built; see Chapter XVI for what that means for this document.
 **Audience** Anyone integrating, operating, or extending this library. No prior context assumed.
 **Companion documents** `api.md` for the callable surface, `operations.md` for building and deploying it.
-**Version** 1.1
+**Version** 1.2
 **Date** 2026-09-16
 
 ---
@@ -29,21 +29,35 @@
   - 2. Numeric widening
   - 3. Nullability compatibility
   - 4. Breaking versus informational
-- V. CPU Feature Detection
+- V. JSON Normalization
+  - 1. What it computes
+  - 2. Malformed versus type-mismatched versus absent
+  - 3. Why only four target types
+- VI. Regex Cleanup
+  - 1. Two ways to get rules
+  - 2. Why only presets are versioned
+- VII. Output Equivalence Testing
+  - 1. What it computes
+  - 2. Column order versus column type
+  - 3. What "equivalent" does not mean
+- VIII. Deduplication
+  - 1. What it computes
+  - 2. Why filter and project are not wrapped here
+- IX. CPU Feature Detection
   - 1. What it does today
   - 2. The constraint it exists to enforce
-- VI. Concurrency Model
-- VII. Failure Model
-- VIII. Security Model
-- IX. Python Binding Boundary
+- X. Concurrency Model
+- XI. Failure Model
+- XII. Security Model
+- XIII. Python Binding Boundary
   - 1. The pyo3 version pin
   - 2. Two-crate split
-- X. Dependencies
-- XI. Assessment
+- XIV. Dependencies
+- XV. Assessment
   - 1. Advantages
   - 2. Disadvantages
   - 3. Conditions under which this design is inappropriate
-- XII. Status and What Comes Next
+- XVI. Status and What Comes Next
 - References
 - Appendix A. Glossary
 
@@ -52,7 +66,9 @@
 - `<Table 3-1>` Type tags used by the hashing kernel
 - `<Table 3-2>` Arrow types supported by `hash_batch`
 - `<Table 4-1>` Numeric widenings accepted under `allow_numeric_widening`
-- `<Table 10-1>` Direct dependencies
+- `<Table 5-1>` JSON-to-Arrow type mapping
+- `<Table 6-1>` Built-in cleanup presets (`v1`)
+- `<Table 14-1>` Direct dependencies
 - `<Table A-1>` Glossary of terms
 
 ### List of Figures
@@ -60,6 +76,7 @@
 - `[Figure 1-1]` Where witchhat sits between Python and Arrow-native data
 - `[Figure 3-1]` Row hash construction
 - `[Figure 4-1]` Shape of a schema diff
+- `[Figure 7-1]` Shape of an equivalence check
 
 ---
 
@@ -84,17 +101,16 @@ layout instead of interpreted per-row logic.
 
 ### 3. Scope and non-goals
 
-In scope, as of this document's version:
+In scope, as of this document's version: composite row and table hashing (Chapter III);
+schema fingerprinting and validation (Chapter IV); JSON normalization (Chapter V); regex
+cleanup (Chapter VI); output-equivalence testing (Chapter VII); deduplication
+(Chapter VIII); CPU feature detection as infrastructure for future SIMD kernels
+(Chapter IX).
 
-- Composite row and table hashing over Arrow `RecordBatch` data (Chapter III).
-- Schema shape fingerprinting and schema validation against an expected shape
-  (Chapter IV).
-- CPU feature detection as infrastructure for future SIMD kernels (Chapter V).
-
-Explicitly not in scope for this document, because not yet built: JSON normalization,
-regex-based cleanup kernels, an output-equivalence test harness, and any kernel that
-replaces a Spark filter, join, or aggregate. See Chapter XII and the repository's
-`README.md` for the ordered backlog.
+Explicitly not in scope for this document, because not yet built: the rest of the
+relational operations a Spark replacement needs (filter and project have off-the-shelf
+Arrow kernels already, so witchhat adds nothing there yet; join and aggregate are
+unbuilt). See Chapter XVI and the repository's `README.md` for the ordered backlog.
 
 Also not in scope, by design: witchhat is not a distributed engine. It targets
 single-node throughput on one Databricks driver or worker; splitting work across a Spark
@@ -115,7 +131,7 @@ Databricks notebook/job -> witchhat kernel (Rust, Arrow-native, single node)
 `DataType`, `RecordBatch`) rather than defining its own columnar representation. Arrow is
 already the format Spark, Databricks, pyarrow, polars and pandas converge on, so a batch
 can move from any of those into a witchhat kernel and back with no copy: the Python
-binding boundary (Chapter IX) accepts anything implementing the Arrow C Data interface,
+binding boundary (Chapter XIII) accepts anything implementing the Arrow C Data interface,
 not `pyarrow` specifically.
 
 ### 2. Why not a bespoke format
@@ -152,9 +168,9 @@ seed(version)
 `"v1"` is the only version today. A future improvement to the algorithm (a faster mixer,
 a wider type table) ships as `"v2"`, never as a silent change to what `"v1"` produces:
 a fingerprint stored today, or used as a partition key, must still be reproducible next
-year under the same version name. This is the same discipline `schema_fingerprint` and
-`table_fingerprint` follow, and the reason both take a `HashVersion` parameter rather than
-always using whatever the latest algorithm happens to be.
+year under the same version name. Every kernel added since (schema validation aside,
+which is structural rather than a hash) follows this same discipline with its own
+version enum: [`NormalizeVersion`](Chapter V) and [`CleanupVersion`](Chapter VI).
 
 ### 3. Type tagging
 
@@ -182,7 +198,7 @@ bytes never do.
 | Boolean, all integer widths, Float32/64, Utf8/LargeUtf8, Binary/LargeBinary | Decimal, Date/Time/Timestamp, List, Struct, Dictionary |
 
 A column outside the supported set returns `Error::UnsupportedType` rather than silently
-falling back to a text representation; see Chapter VII.
+falling back to a text representation; see Chapter XI.
 
 ### 4. Null and float handling
 
@@ -190,19 +206,16 @@ A `null` cell hashes distinctly from every non-null value of its column, includi
 empty string or a numeric zero, by hashing a fixed sentinel byte instead of the (absent)
 value's bytes. `Float32`/`Float64` values are canonicalized before hashing: every `NaN`
 bit pattern collapses to Rust's canonical `NAN` constant, and `-0.0` is normalized to
-`0.0`. This makes the hash agree with IEEE-754 equality (`NaN != NaN` is irrelevant here;
-what matters is that two `NaN` payloads that Spark or pyarrow both call "the same missing
-value" hash the same) rather than with the bit pattern, which would make two
-representations of the same logical float hash differently.
+`0.0`. This makes the hash agree with IEEE-754 equality rather than with the bit pattern,
+which would make two representations of the same logical float hash differently.
 
 ### 5. The two fingerprint shapes
 
 `hash_batch`/`hash_batch_all_columns` produce a per-row fingerprint: the shape a dedup
-key or change-data-capture identity needs. `table_fingerprint` folds a whole array of row
-hashes into one `u64` with wrapping addition, which is commutative and associative, so a
-re-shuffled or re-partitioned batch fingerprints the same. This is the shape an
-output-equivalence check needs: fingerprint witchhat's rows, fingerprint Spark's rows,
-compare the two integers, with neither side sorted first.
+key or change-data-capture identity needs (Chapter VIII uses exactly this). `table_
+fingerprint` folds a whole array of row hashes into one `u64` with wrapping addition,
+which is commutative and associative, so a re-shuffled or re-partitioned batch
+fingerprints the same. Chapter VII's equivalence check is built on this second shape.
 
 ## IV. Schema Validation
 
@@ -221,9 +234,9 @@ actual.fields   ----+                     retyped:      present in both, type di
 
 [Figure 4-1] Shape of a schema diff
 
-This complements `schema_fingerprint` (Chapter II is the data model it operates on):
-fingerprinting only says "these differ", `validate_schema` says how, which is what a
-caller needs to decide whether a difference is safe to proceed with.
+This complements `schema_fingerprint`: fingerprinting only says "these differ",
+`validate_schema` says how, which is what a caller needs to decide whether a difference
+is safe to proceed with.
 
 ### 2. Numeric widening
 
@@ -243,91 +256,231 @@ type than `expected` within the same signedness and int-vs-float class.
 | UInt32 | UInt64 |
 | Float32 | Float64 |
 
-A narrower actual type, a cross-signedness change (`Int32` -> `UInt32`), or an
-integer-to-float change is never accepted, even with the option on: those can silently
-change what a value means (a negative integer reinterpreted as unsigned, a large integer
-losing precision as a float), not just how many bits hold it. This is deliberately more
-conservative than Spark's own implicit-cast rules, since witchhat has no way to know
-whether a given caller's downstream logic can tolerate the precision or sign change.
+A narrower actual type, a cross-signedness change, or an integer-to-float change is never
+accepted, even with the option on: those can silently change what a value means, not just
+how many bits hold it. Deliberately more conservative than Spark's own implicit-cast
+rules, since witchhat has no way to know whether a given caller's downstream logic can
+tolerate the precision or sign change.
 
 ### 3. Nullability compatibility
 
 `actual`'s nullability is checked against `expected`'s in one direction only: `actual`
 may be nullable when `expected` is too, or non-nullable when `expected` allows null, but
 not nullable when `expected` declares the column non-nullable. A promise of "never null"
-is the only direction that can break a caller, since code written against a non-nullable
-`expected` may skip a null check that a nullable `actual` then needs; the reverse means
-`actual` guarantees more than was promised, which is always safe to accept.
+is the only direction that can break a caller.
 
 ### 4. Breaking versus informational
 
 `SchemaDiff` distinguishes what most callers cannot safely ignore from what is merely
 informational. `missing`, `retyped` and `nullability` entries make `is_breaking()` true.
-An `unexpected` column (present in `actual`, not in `expected`) does not: additive schema
-evolution, a new column showing up, does not usually invalidate code written against the
-old, narrower schema. A caller that does need to reject additive changes can still check
-`unexpected` directly; `is_breaking()` is a convenience for the common case, not the only
-way to read the diff.
+An `unexpected` column does not: additive schema evolution does not usually invalidate
+code written against the old, narrower schema. Chapter VII's equivalence check is
+deliberately *stricter* than this distinction (Section 3 there explains why).
 
-## V. CPU Feature Detection
+## V. JSON Normalization
+
+### 1. What it computes
+
+`normalize_json(json, schema, version)` parses one JSON object per row of a `Utf8`
+column into a fixed target `Schema`, returning both the resulting `RecordBatch` and a
+`NormalizeStats`. A target field's name is a `.`-separated path into the JSON object
+(`"address.city"` reads `{"address": {"city": ...}}`), so one level of nested-object
+flattening is supported without a caller having to pre-flatten the JSON themselves.
+
+<Table 5-1> JSON-to-Arrow type mapping
+
+| JSON type | Target Arrow type |
+|---|---|
+| string | Utf8 |
+| number (integral) | Int64 |
+| number (any) | Float64 |
+| boolean | Boolean |
+| `null`, absent | (any of the above; see Section 2) |
+| object, array | Not supported as a leaf value; see Section 2 |
+
+### 2. Malformed versus type-mismatched versus absent
+
+Three distinct situations produce a null, and only one of them is counted as a problem in
+`NormalizeStats`, following the same "structural problems are counted, type uncertainty
+degrades quietly" split `rust-streamer-pgdb` uses for its own third-party input:
+
+- **A row's JSON does not parse, or is not an object at the top level.** Every column is
+  null for that row, and it counts in `NormalizeStats::rows_malformed`. This is the
+  loudest signal: the input was not JSON in the shape this function requires at all.
+- **A path is absent, or its value is JSON `null`.** An ordinary, expected null. Not
+  counted anywhere: a caller passing a schema wider than what every record actually
+  populates is normal, not a data-quality problem.
+- **A path is present with a value of the wrong JSON type** (a string where the column
+  is `Int64`, an object or array as a leaf value, since neither is representable by any
+  of the four target types). Written as null, and counted in `NormalizeStats::
+  type_mismatches` per column. This is the middle case: the input's actual shape
+  disagreed with what the caller declared, worth surfacing but not worth failing the
+  whole row over.
+
+### 3. Why only four target types
+
+`Utf8`, `Int64`, `Float64`, `Boolean` cover every JSON scalar type one-to-one. Nested
+objects and arrays as a *leaf* value are deliberately unsupported (they fall into the
+type-mismatch case in Section 2) rather than serialized back to a JSON string or given a
+`List`/`Struct` Arrow representation: either of those is a real feature with its own
+design questions (recursive flattening depth, array-of-object handling) that has not
+been asked for yet. One level of *object* nesting is supported today only because a
+dotted field path costs nothing extra to implement once path-walking exists at all.
+
+## VI. Regex Cleanup
+
+### 1. Two ways to get rules
+
+`apply_rules(input, rules)` takes a caller-supplied list of `CleanRule` (a compiled
+regex plus its replacement text) and applies them in order to every non-null value.
+`clean_with_preset(input, name, version)` is `preset(name, version)` (look up one of
+witchhat's own named rule sets) followed by `apply_rules`.
+
+<Table 6-1> Built-in cleanup presets (`v1`)
+
+| Preset | Effect |
+|---|---|
+| `trim_whitespace` | Removes leading and trailing whitespace |
+| `collapse_whitespace` | Collapses any run of whitespace to a single space |
+| `strip_control_characters` | Removes ASCII control characters |
+| `strip_non_alphanumeric` | Removes everything except letters, digits and whitespace |
+| `digits_only` | Removes everything except `0`-`9` |
+
+### 2. Why only presets are versioned
+
+`CleanupVersion` gates `preset`'s name-to-rules table, not `apply_rules` itself. A
+caller's own regex, passed directly to `apply_rules`, is the caller's own algorithm:
+witchhat did not write it and has no more business versioning it than it does
+versioning a caller's SQL. Only witchhat's *own* named behaviour (a preset shipped under
+a fixed name) needs the same "a version, once shipped, never changes what it produces"
+discipline as `HashVersion`, because only that behaviour is something a caller might
+depend on by name across a witchhat upgrade.
+
+## VII. Output Equivalence Testing
+
+### 1. What it computes
+
+`check_equivalence(actual, expected, options)` answers "are these two batches the same
+data", combining Chapter IV's schema comparison with Chapter III's table fingerprint
+rather than adding a third comparison algorithm:
+
+```
+actual.schema, expected.schema -> validate_schema -> schema_diff
+actual.rows,   expected.rows   -> hash_batch, table_fingerprint (shared column order) -> two u64s
+                                                                          |
+                                                            EquivalenceReport.is_equivalent()
+```
+
+[Figure 7-1] Shape of an equivalence check
+
+### 2. Column order versus column type
+
+The two table fingerprints are computed over the same column list and order
+(`EquivalenceOptions.columns`, defaulting to the columns `expected` and `actual` have in
+common, in `expected`'s order), so a column merely declared in a different position on
+each side does not by itself cause a mismatch, even though `hash_batch` is normally
+order-sensitive (Chapter III, Section 1). A column whose *type* differs still causes a
+mismatch, because `hash_batch` hashes a value's type tag along with its bytes
+(Chapter III, Section 3): an `Int32` `5` and an `Int64` `5` are not the same fingerprint,
+even though `validate_schema` might consider that difference an accepted widening. This
+is deliberate: equivalence testing asks "is the output the same", not "is the output an
+acceptable evolution of the reference", which is what schema validation asks.
+
+### 3. What "equivalent" does not mean
+
+`EquivalenceReport::is_equivalent()` is deliberately stricter than
+`SchemaDiff::is_breaking()`: it requires the schema diff to be entirely empty, not just
+non-breaking. An `actual` batch with one extra column passes `validate_schema`'s
+breaking check (additive change) but fails `is_equivalent()`, because the question being
+asked is "are these the same", not "would `actual` be a safe evolution of `expected`".
+
+## VIII. Deduplication
+
+### 1. What it computes
+
+`drop_duplicates(batch, columns, version)` is the first native transformation
+(`architecture.md` Chapter I's actual goal), equivalent to Spark's
+`df.dropDuplicates(subset=columns)`. It reuses `hash_batch` as the dedup key: one pass
+computes each row's composite hash over `columns`, a `HashSet<u64>` tracks which hashes
+have been seen, and `arrow_select::filter::filter_record_batch` keeps only the rows
+whose hash was new. Which row survives within a duplicate group is always the first one
+by input order, unlike Spark's own `dropDuplicates`, whose choice there is unspecified.
+
+### 2. Why filter and project are not wrapped here
+
+Filter (row selection by a boolean predicate) and project (column selection/reorder)
+already exist as Arrow compute kernels (`arrow_select::filter::filter_record_batch`,
+`RecordBatch::project`) with no witchhat-specific behaviour to add: wrapping them would
+be a naming exercise, not a transformation. `dedup.rs` exists because deduplication
+*does* need witchhat's own hashing, and is the natural first module for anything that
+does. Join and aggregate are the two relational operations still genuinely unbuilt; see
+Chapter XVI.
+
+## IX. CPU Feature Detection
 
 ### 1. What it does today
 
 `witchhat_core::cpu::features()` detects AVX2, AVX-512F and SSE4.2 on x86_64 and NEON on
-aarch64, once per process, cached in a `OnceLock`. Nothing in the current kernels branches
-on it: `xxhash-rust`'s XXH3 implementation (Chapter III) already does its own internal
-SIMD dispatch, and its output is defined to be identical regardless of which internal code
-path ran; schema validation (Chapter IV) does no per-byte work at all.
+aarch64, once per process, cached in a `OnceLock`. Nothing in the current kernels
+branches on it: `xxhash-rust`'s XXH3 (Chapter III) already does its own internal SIMD
+dispatch with output defined to be identical regardless of code path; the regex engine
+(Chapter VI) does its own dispatch the same way; JSON parsing (Chapter V), schema
+validation (Chapter IV) and deduplication (Chapter VIII) do no per-byte SIMD-shaped work
+at all.
 
 ### 2. The constraint it exists to enforce
 
-This module exists ahead of a concrete user because every kernel this library adds later
-(regex cleanup, JSON normalization) is a SIMD dispatch candidate, and the constraint has
-to be established before the first one is written, not retrofitted: **a SIMD-accelerated
-path may only change speed, never output.** A fingerprint or transformation computed on a
-Databricks driver with AVX-512 must equal one computed on a laptop with only SSE4.2, or
-results stop being comparable across a mixed-hardware fleet, which defeats the purpose of
-`table_fingerprint`-style equivalence checking. Any future kernel that adds a SIMD fast
-path is expected to carry a differential test asserting exactly that.
+This module exists ahead of a concrete user because a future kernel could be a SIMD
+dispatch candidate, and the constraint has to be established before one is written, not
+retrofitted: **a SIMD-accelerated path may only change speed, never output.** A
+fingerprint or transformation computed on a Databricks driver with AVX-512 must equal one
+computed on a laptop with only SSE4.2, or results stop being comparable across a
+mixed-hardware fleet, which defeats the purpose of `table_fingerprint`/`check_
+equivalence`-style checking. Any future kernel that adds a SIMD fast path is expected to
+carry a differential test asserting exactly that.
 
-## VI. Concurrency Model
+## X. Concurrency Model
 
 Every function in `witchhat-core` is synchronous, single-threaded, and allocation-bounded
 by its input size; none spawn threads, perform I/O, or hold a lock across a call. The
-PyO3 boundary (Chapter IX) does not release the GIL during a call, because every
+PyO3 boundary (Chapter XIII) does not release the GIL during a call, because every
 current operation is CPU-bound and short relative to the cost of a Python call itself.
-This is expected to change once a kernel is expensive enough (a multi-hundred-megabyte
-JSON normalization pass, say) that releasing the GIL for the duration becomes worth its
-own overhead; Chapter XII tracks it as an open item.
+This is expected to change once a kernel is expensive enough that releasing the GIL for
+the duration becomes worth its own overhead; Chapter XVI tracks it as an open item.
 
-## VII. Failure Model
+## XI. Failure Model
 
 `witchhat-core` returns `Result<T, witchhat_core::Error>` from every fallible function;
-nothing panics on a caller-supplied input. `Error` has five variants: `UnknownColumn` (a
-requested column name is not in the schema), `TypeMismatch` and `UnsupportedType` (a
-column's Arrow type cannot be processed), `SchemaMismatch` (reserved for a future kernel
-that needs to fail rather than report a diff; `validate_schema` itself never returns an
-`Error`, since an unequal schema is a normal, representable result, not a failure), and
-`Config` (an invalid argument combination). At the Python boundary, every variant becomes
-a `RuntimeError` except an unrecognised `HashVersion` name, which is checked separately
-and raised as `ValueError`, matching Python's own convention of using `ValueError` for a
-bad argument rather than a generic runtime failure.
+nothing panics on a caller-supplied input. `Error` has five variants: `UnknownColumn`,
+`TypeMismatch` and `UnsupportedType` (a column cannot be processed), `SchemaMismatch`
+(used by `dedup`'s `filter_record_batch` failure path and reserved more broadly), and
+`Config` (an invalid argument: an unrecognised cleanup preset name, or a regex that does
+not compile). `validate_schema` and `normalize_json`'s row-level problems are
+deliberately *not* `Error`: an unequal schema is a normal `SchemaDiff`, and a malformed
+JSON row is a normal, counted null, not a failure of the whole batch (Chapter V,
+Section 2) — only a structural problem that makes the *call itself* impossible (an
+unsupported target type, an unknown column) is an `Error`. At the Python boundary, every
+`Error` variant becomes a `RuntimeError` except an unrecognised version/preset name,
+which is raised as `ValueError`, matching Python's own convention.
 
-## VIII. Security Model
+## XII. Security Model
 
 witchhat's current kernels take no network input, spawn no subprocess, and read no
-filesystem path: the only input is Arrow data already resident in the caller's process.
-`witchhat-core` is `#![forbid(unsafe_code)]`; the only `unsafe` in the dependency tree is
-inside `pyo3`, `arrow`, and `xxhash-rust` themselves, none of which this crate's own code
-touches directly. There is no credential handling, no path construction from
-caller-supplied strings, and no logging of row data, so the security requirements that
-dominate a system reading untrusted external input (see `rust-streamer-pgdb`'s
-`CLAUDE.md` for an example of what that looks like) mostly do not yet apply here. They
-will become relevant again once a kernel reads from an external path or network source
-(a JSON-from-object-storage normalization pass, for instance), and should be revisited at
-that point rather than assumed to still not apply.
+filesystem path: the only input is Arrow data (or, for `normalize_json`, JSON text
+already inside an Arrow column) already resident in the caller's process. `witchhat-core`
+is `#![forbid(unsafe_code)]`; the only `unsafe` in the dependency tree is inside `pyo3`,
+`arrow`, `xxhash-rust`, `regex` and `serde_json` themselves, none of which this crate's
+own code touches directly. `normalize_json` parses caller-supplied JSON text with
+`serde_json`, a widely used, actively maintained parser; a malformed or adversarial JSON
+string degrades to a counted null (Chapter V, Section 2) rather than being retried or
+logged verbatim, so a hostile row cannot escalate into anything beyond "this row is
+null". There is no credential handling and no logging of row data, so the security
+requirements that dominate a system reading untrusted *external* input (network, files;
+see `rust-streamer-pgdb`'s `CLAUDE.md` for what that looks like) mostly do not yet apply
+here, and should be revisited once a kernel reads from an external path or network
+source.
 
-## IX. Python Binding Boundary
+## XIII. Python Binding Boundary
 
 ### 1. The pyo3 version pin
 
@@ -335,19 +488,18 @@ that point rather than assumed to still not apply.
 Cargo feature, used for zero-copy `RecordBatch`/`ArrayData` conversion, links `pyo3-ffi`
 as a native library and Cargo only tolerates one exact version of a `links`-declaring
 crate across the whole dependency graph. Bumping `pyo3` therefore requires `arrow` to
-have caught up to a newer `pyo3` first, not just editing the version string in
-`Cargo.toml`; attempting that produces a resolver error at `cargo build` time (`only one
-package in the dependency graph may specify the same links value`), which is the signal
-to check `arrow`'s current `pyo3` pin before retrying.
+have caught up to a newer `pyo3` first, not just editing the version string.
 
-One consequence, hit while adding schema validation: `arrow`'s pyarrow bridge
-(`ToPyArrow`/`FromPyArrow`) is implemented for `ArrayData`, `DataType`, `Schema`, `Field`,
-`RecordBatch` and `Vec<T>` of those, but the `PyArrowType<T>` wrapper it returns does not
-implement `Clone`. A `#[pyclass]` field exposed via `#[pyo3(get)]` needs `Clone` (the
-generated getter clones the field to return an owned value), so `SchemaDiff.retyped`
-(a `pyarrow.DataType` pair per retyped column) stores plain, `Clone`-able `DataType`
-internally and builds a fresh `PyArrowType` in a hand-written `#[getter]` instead; see
-`crates/witchhat-py/src/python.rs`.
+One consequence, hit while adding schema validation and reused for every kernel since:
+`arrow`'s pyarrow bridge implements `ToPyArrow`/`FromPyArrow` for `ArrayData`, `DataType`,
+`Schema`, `Field`, `RecordBatch` and `Vec<T>` of those, but not for typed arrays
+(`UInt64Array`, `StringArray`) and not `Clone` on the `PyArrowType<T>` wrapper itself.
+Every kernel taking or returning a typed array converts through `ArrayData` at the
+`witchhat-py` boundary (`u64_array_to_pyarrow`/`_from_pyarrow`,
+`string_array_to_pyarrow`/`_from_pyarrow` in `crates/witchhat-py/src/python.rs`); a
+`#[pyclass]` field holding per-column `DataType` pairs (`SchemaDiff.retyped`) stores
+plain, `Clone`-able `DataType` and builds a fresh `PyArrowType` in a hand-written
+`#[getter]`, since `#[pyo3(get)]` needs to clone the field to return it.
 
 ### 2. Two-crate split
 
@@ -357,75 +509,91 @@ single-crate layout, and is deliberate here: a future Rust-only consumer (a CLI,
 service embedding witchhat directly) links `witchhat-core` without pulling in `pyo3` or
 its `abi3`/`extension-module` feature machinery at all.
 
-## X. Dependencies
+## XIV. Dependencies
 
-<Table 10-1> Direct dependencies
+<Table 14-1> Direct dependencies
 
 | Crate | Why |
 |---|---|
 | `arrow-array`, `arrow-schema`, `arrow-data` | The data model (Chapter II); `witchhat-core` depends on the first two only |
+| `arrow-select` | `filter_record_batch`, the kernel `drop_duplicates` (Chapter VIII) is built on |
 | `arrow` (feature `pyarrow`) | Zero-copy conversion at the PyO3 boundary, `witchhat-py` only |
 | `xxhash-rust` (feature `xxh3`) | The per-value hash function underlying `hash_batch` |
-| `thiserror` | The `Error` enum (Chapter VII) |
-| `pyo3` | Python bindings, `witchhat-py` only; see Section IX.1 for the version pin |
+| `serde_json` | JSON parsing for `normalize_json` (Chapter V) |
+| `regex` | Pattern compilation and replacement for `clean` (Chapter VI) |
+| `thiserror` | The `Error` enum (Chapter XI) |
+| `pyo3` | Python bindings, `witchhat-py` only; see Section XIII.1 for the version pin |
 
 Pinned 2026-09 (probed via `cargo build`; crates.io index reachable): `arrow 56.2.1`,
-`xxhash-rust 0.8.18`, `thiserror 2.0.20`, `pyo3 0.25.1`.
+`xxhash-rust 0.8.18`, `serde_json 1.0.151`, `regex 1.13.1`, `thiserror 2.0.20`,
+`pyo3 0.25.1`.
 
-## XI. Assessment
+## XV. Assessment
 
 ### 1. Advantages
 
 - Zero-copy Arrow interop: no serialization step between Spark/pyarrow/polars and a
   witchhat kernel.
-- Versioning discipline applied from the first kernel, not retrofitted after a second one
-  needed it.
-- `validate_schema` reports what differs, not just that something does, so a caller can
-  distinguish a breaking change from additive schema evolution (Chapter IV, Section 4).
+- Versioning discipline applied consistently across every kernel that defines its own
+  named behaviour (hashing, JSON normalization, cleanup presets), not just the first one.
+- `validate_schema` and `check_equivalence` both report *how* two things differ, not
+  just whether they do, so a caller can act on the specific difference.
+- Deduplication reuses the hashing kernel rather than adding a second row-comparison
+  algorithm; filter and project were left to Arrow's own kernels rather than reinvented.
 - No `unsafe` in this crate's own code; the dependency surface is small and each
-  dependency's role is documented (Chapter X).
+  dependency's role is documented (Chapter XIV).
 
 ### 2. Disadvantages
 
-- Two kernels implemented so far: the "replace Spark" goal is aspirational until
-  Chapter XII's backlog lands.
-- No SIMD-accelerated path yet, despite Chapter V's infrastructure; XXH3's own internal
-  dispatch is the only acceleration currently in effect.
-- `table_fingerprint`'s wrapping-sum combiner is not collision-resistant against an
-  adversarial input (Chapter III, Section 5); fine for equivalence testing between
-  trusted pipelines, not a substitute for a cryptographic MAC.
-- `validate_schema`'s numeric-widening table (Chapter IV, Section 2) is deliberately
-  narrower than Spark's own implicit-cast rules; a schema comparison that Spark would
-  accept silently can still be reported as retyped here.
+- Six kernels implemented so far, but join and aggregate (the operations that most
+  directly replace a nontrivial Spark job) are not among them yet.
+- No SIMD-accelerated path yet, despite Chapter IX's infrastructure; XXH3's and `regex`'s
+  own internal dispatch is the only acceleration currently in effect.
+- `table_fingerprint`'s wrapping-sum combiner (and by extension `check_equivalence`) is
+  not collision-resistant against an adversarial input; fine for equivalence testing
+  between trusted pipelines, not a substitute for a cryptographic MAC.
+- `normalize_json`'s one-level-of-object-path support (Chapter V, Section 3) will not
+  satisfy every real-world nested JSON shape; array-of-object flattening in particular
+  is unbuilt.
+- `validate_schema`'s numeric-widening table is deliberately narrower than Spark's own
+  implicit-cast rules; a schema comparison Spark would accept silently can still be
+  reported as retyped here.
 
 ### 3. Conditions under which this design is inappropriate
 
 - A dataset whose Arrow representation does not fit in memory on one node: witchhat has
   no distributed execution model, and is not intended to gain one (Chapter I, Section 3).
 - A column type outside Table 3-2's supported set, until that type is added.
-- A use case needing cryptographic collision resistance from `table_fingerprint`, rather
-  than equivalence-testing evidence.
-- A schema-compatibility policy that needs to match Spark's own implicit-cast rules
-  exactly, rather than the conservative subset in Table 4-1.
+- JSON with array-valued fields, or more than one level of object nesting, that need to
+  be preserved rather than degraded to a counted null.
+- A use case needing cryptographic collision resistance from `table_fingerprint`/
+  `check_equivalence`, rather than equivalence-testing evidence.
+- A workload whose bottleneck is join or aggregate, which witchhat does not yet replace.
 
-## XII. Status and What Comes Next
+## XVI. Status and What Comes Next
 
-Implemented and tested: composite row/table hashing, schema fingerprinting, schema
-validation with a breaking/informational diff, CPU feature detection, the Python binding
-boundary, the `abi3-py310` wheel build.
+Implemented and tested: composite row/table hashing, schema fingerprinting and
+validation, JSON normalization, regex cleanup (ad hoc and presets), output-equivalence
+testing, deduplication, CPU feature detection, the Python binding boundary, the
+`abi3-py310` wheel build.
 
-Not yet built, in the order the project's stated goal needs them: JSON normalization, a
-regex-based cleanup kernel, an output-equivalence test harness built on
-`table_fingerprint`, and the native transformations (filter/project/join/aggregate) that
-are the actual Spark replacement. See the repository `README.md` for the up-to-date
-backlog; this document describes the architecture of what exists, and is expected to gain
-chapters as each item above lands rather than being rewritten from scratch.
+Not yet built: join and aggregate, the two relational operations still needed for
+"native transformations" to be a real Spark replacement rather than a supporting kernel
+library. Also open, tracked separately from the Rust/Python surface itself: publishing
+to a package repository (needs credentials this repository's automation does not have)
+and verifying installation from a Unity Catalog Volume against a real Databricks
+workspace (needs access this development environment does not have); see
+`docs/operations.md` Chapter VI for both. See the repository `README.md` for the
+up-to-date backlog; this document describes the architecture of what exists, and is
+expected to gain chapters as each item lands rather than being rewritten from scratch.
 
 ## References
 
 - Apache Arrow columnar format: <https://arrow.apache.org/docs/format/Columnar.html>
 - Arrow C Data Interface: <https://arrow.apache.org/docs/format/CDataInterface.html>
 - `xxhash-rust` / XXH3: <https://docs.rs/xxhash-rust>
+- `serde_json`: <https://docs.rs/serde_json>
+- `regex` crate syntax: <https://docs.rs/regex>
 - PyO3 user guide: <https://pyo3.rs>
 - `rust-streamer-pgdb`, a companion project this documentation and CI convention is
   adopted from: `D:\ruststreamer\rust-streamer-pgdb\CLAUDE.md`
@@ -442,5 +610,8 @@ chapters as each item above lands rather than being rewritten from scratch.
 | Type tag | A one-byte prefix distinguishing Arrow types that could share raw bytes |
 | `SchemaDiff` | The structured result of `validate_schema`; see Chapter IV |
 | Breaking (schema diff) | A missing, retyped, or nullability-tightened column; see Chapter IV, Section 4 |
+| `NormalizeStats` | Malformed-row and type-mismatch counts from `normalize_json`; see Chapter V, Section 2 |
+| Preset | A named, versioned built-in `CleanRule` set; see Chapter VI |
+| `EquivalenceReport` | The structured result of `check_equivalence`; see Chapter VII |
 | abi3 | CPython's stable ABI; one compiled extension loads on every Python from the
 declared floor version onward |

@@ -1,10 +1,10 @@
 # witchhat: API Reference
 
 **Document type** Interface specification
-**Status** Describes the surface as built: composite hashing, schema validation, and schema/CPU introspection.
+**Status** Describes the surface as built: composite hashing, schema validation, JSON normalization, regex cleanup, output-equivalence testing, deduplication, and schema/CPU introspection.
 **Audience** Anyone calling this library from Python or from Rust.
 **Companion documents** `architecture.md` for why the design is shaped this way, `operations.md` for building and deploying it.
-**Version** 1.1
+**Version** 1.2
 **Date** 2026-09-16
 
 ---
@@ -21,24 +21,29 @@
   - 4. `table_fingerprint`
   - 5. `schema_fingerprint`
   - 6. `validate_schema` and `SchemaDiff`
-  - 7. `cpu_features` and `CpuFeatures`
+  - 7. `normalize_json` and `NormalizeStats`
+  - 8. `clean_with_preset` and `clean_with_rules`
+  - 9. `check_equivalence` and `EquivalenceReport`
+  - 10. `drop_duplicates`
+  - 11. `cpu_features` and `CpuFeatures`
 - III. Rust Surface
   - 1. Entry points
-  - 2. `HashVersion`
-  - 3. `ValidateSchemaOptions` and `SchemaDiff`
-  - 4. Module map
-  - 5. Error type
+  - 2. Version enums
+  - 3. Module map
+  - 4. Error type
 - IV. Semantics Callers Must Know
   - 1. Column order
   - 2. Null and float equality
   - 3. Version pinning
   - 4. What accepts non-pyarrow objects
   - 5. `validate_schema` argument order
+  - 6. `check_equivalence` is stricter than "not breaking"
 - V. Worked Examples
   - 1. Deduplicating rows
   - 2. Checking output against Spark
   - 3. Validating a batch before processing it
-  - 4. Calling from Rust
+  - 4. Normalizing JSON, then cleaning a column
+  - 5. Calling from Rust
 - References
 - Appendix A. Parameter quick reference
 
@@ -47,6 +52,9 @@
 - `<Table 2-1>` Parameters of `hash_rows`
 - `<Table 2-2>` Exceptions raised by the Python surface
 - `<Table 2-3>` Fields and methods of `SchemaDiff`
+- `<Table 2-4>` Fields of `NormalizeStats`
+- `<Table 2-5>` Built-in cleanup presets
+- `<Table 2-6>` Fields and methods of `EquivalenceReport`
 - `<Table 3-1>` Public Rust modules
 - `<Table A-1>` Parameter quick reference
 
@@ -113,12 +121,12 @@ version ("v1")               -+
 
 | Exception | Raised when |
 |---|---|
-| `ValueError` | `version` does not name a known algorithm |
-| `RuntimeError` | A name in `columns` is not in `batch`'s schema, or a column's Arrow type has no defined hash |
+| `ValueError` | `version` does not name a known algorithm, or a preset `name` is unrecognised |
+| `RuntimeError` | A name in `columns` is not in `batch`'s schema, or a column's Arrow type has no defined hash/kernel |
 
-`validate_schema` (Section 6) is the one exception: it never raises for a schema
-mismatch, since a difference is a normal, representable result, not a failure. It still
-raises `TypeError`/`ValueError` for a malformed argument, like any Python function.
+`validate_schema` and `normalize_json` are the exceptions to the `RuntimeError` row: a
+schema mismatch and a malformed JSON row are both normal, representable results, not
+failures. See their own sections below.
 
 ### 3. `hash_rows_all_columns`
 
@@ -137,8 +145,6 @@ witchhat.table_fingerprint(row_hashes, version="v1") -> int
 
 Folds an array of row hashes (such as `hash_rows`'s return value) into one
 order-independent `uint64`. `row_hashes` is any Arrow-C-Data-exportable `uint64` array.
-`version` should match what `row_hashes` was computed with, though nothing enforces this:
-by the time an array of plain integers reaches this function, its provenance is gone.
 Raises `ValueError` for an unrecognised `version`.
 
 ### 5. `schema_fingerprint`
@@ -159,8 +165,7 @@ witchhat.validate_schema(actual, expected, allow_numeric_widening=False) -> witc
 
 Compares `actual` against `expected`, column by column matched by name
 (case-sensitive), and returns a `SchemaDiff` describing exactly how they differ. Never
-raises for a mismatch; see `architecture.md` Chapter IV for the full comparison rules
-(numeric widening, nullability direction).
+raises for a mismatch; see `architecture.md` Chapter IV for the full comparison rules.
 
 <Table 2-3> Fields and methods of `SchemaDiff`
 
@@ -173,18 +178,89 @@ raises for a mismatch; see `architecture.md` Chapter IV for the full comparison 
 | `.is_empty()` | `bool` | True if `actual` and `expected` agreed on every point checked |
 | `.is_breaking()` | `bool` | True if `missing`, `retyped`, or `nullability` is non-empty; `unexpected` alone does not count |
 
-`.retyped`'s type entries are real `pyarrow.DataType` objects (`arrow-rs`'s pyarrow
-bridge constructs them directly), not strings, so `pyarrow.types.is_integer(...)` and
-similar predicates work on them without parsing.
+### 7. `normalize_json` and `NormalizeStats`
 
-### 7. `cpu_features` and `CpuFeatures`
+```python
+witchhat.normalize_json(json, schema, version="v1") -> tuple[pyarrow.RecordBatch, witchhat.NormalizeStats]
+```
+
+Parses one JSON object per row of `json` into `schema`. A field name may be a
+`.`-separated path (`"address.city"`) to read one level into a nested object. See
+`architecture.md` Chapter V for the full malformed/mismatch/absent distinction.
+
+<Table 2-4> Fields of `NormalizeStats`
+
+| Field | Type | Meaning |
+|---|---|---|
+| `.rows_malformed` | `int` | Rows whose JSON text did not parse, or was not an object |
+| `.type_mismatches` | `dict[str, int]` | `{column: count}` for rows whose value at that path had the wrong JSON type |
+
+### 8. `clean_with_preset` and `clean_with_rules`
+
+```python
+witchhat.clean_with_preset(input, name, version="v1") -> pyarrow.Array
+witchhat.clean_with_rules(input, rules) -> pyarrow.Array
+```
+
+`clean_with_preset` applies one of witchhat's own named, versioned rule sets.
+`clean_with_rules` applies caller-supplied `(pattern, replacement)` regex rules
+directly; these are the caller's own rules and are not versioned by witchhat (see
+`architecture.md` Chapter VI, Section 2).
+
+<Table 2-5> Built-in cleanup presets
+
+| Preset | Effect |
+|---|---|
+| `trim_whitespace` | Removes leading and trailing whitespace |
+| `collapse_whitespace` | Collapses any run of whitespace to a single space |
+| `strip_control_characters` | Removes ASCII control characters |
+| `strip_non_alphanumeric` | Removes everything except letters, digits and whitespace |
+| `digits_only` | Removes everything except `0`-`9` |
+
+Both raise `ValueError`: `clean_with_preset` for an unrecognised `name` or `version`,
+`clean_with_rules` for a pattern that does not compile.
+
+### 9. `check_equivalence` and `EquivalenceReport`
+
+```python
+witchhat.check_equivalence(actual, expected, columns=None, allow_numeric_widening=False, hash_version="v1") -> witchhat.EquivalenceReport
+```
+
+Compares `actual` against `expected`: same schema, same row count, same rows regardless
+of order. See `architecture.md` Chapter VII for how the schema and row comparisons
+combine, and Section 6 below for what `is_equivalent()` does and does not mean.
+
+<Table 2-6> Fields and methods of `EquivalenceReport`
+
+| Member | Type | Meaning |
+|---|---|---|
+| `.schema_diff` | `SchemaDiff` | The schema half of the comparison |
+| `.row_count_actual`, `.row_count_expected` | `int` | Row counts of each side |
+| `.table_fingerprint_actual`, `.table_fingerprint_expected` | `int` | Order-independent fingerprints over the compared columns |
+| `.fingerprints_match` | `bool` | Whether the two table fingerprints matched |
+| `.is_equivalent()` | `bool` | Empty schema diff, matching row counts, matching fingerprints |
+
+Raises `RuntimeError` for an unknown column or unsupported column type, `ValueError` for
+an unrecognised `hash_version`.
+
+### 10. `drop_duplicates`
+
+```python
+witchhat.drop_duplicates(batch, columns, version="v1") -> pyarrow.RecordBatch
+```
+
+Keeps the first row of every distinct value of `columns`, dropping the rest, preserving
+the relative order of the rows that remain. Equivalent to Spark's
+`df.dropDuplicates(subset=columns)`. Same exceptions as `hash_rows`.
+
+### 11. `cpu_features` and `CpuFeatures`
 
 ```python
 witchhat.cpu_features() -> witchhat.CpuFeatures
 ```
 
 Returns a `CpuFeatures` instance with boolean properties `sse42`, `avx2`, `avx512f`,
-`neon`. See `architecture.md` Chapter V for why this exists and what it does (and does
+`neon`. See `architecture.md` Chapter IX for why this exists and what it does (and does
 not yet) affect.
 
 ## III. Rust Surface
@@ -197,45 +273,31 @@ witchhat_core::hash_batch_all_columns(batch: &RecordBatch, version: HashVersion)
 witchhat_core::table_fingerprint(row_hashes: &UInt64Array, version: HashVersion) -> u64
 witchhat_core::schema_fingerprint(schema: &Schema, version: HashVersion) -> u64
 witchhat_core::validate_schema(actual: &Schema, expected: &Schema, options: ValidateSchemaOptions) -> SchemaDiff
+witchhat_core::normalize_json(json: &StringArray, schema: &Schema, version: NormalizeVersion) -> Result<(RecordBatch, NormalizeStats)>
+witchhat_core::apply_rules(input: &StringArray, rules: &[CleanRule]) -> StringArray
+witchhat_core::clean_with_preset(input: &StringArray, name: &str, version: CleanupVersion) -> Result<StringArray>
+witchhat_core::check_equivalence(actual: &RecordBatch, expected: &RecordBatch, options: EquivalenceOptions) -> Result<EquivalenceReport>
+witchhat_core::drop_duplicates(batch: &RecordBatch, columns: &[&str], version: HashVersion) -> Result<RecordBatch>
 witchhat_core::features() -> CpuFeatures
 ```
 
-All synchronous, none perform I/O; see `architecture.md` Chapter VI for the concurrency
+All synchronous, none perform I/O; see `architecture.md` Chapter X for the concurrency
 model. Full rustdoc, including examples, is on every item (`cargo doc --no-deps -p
 witchhat-core`).
 
-### 2. `HashVersion`
+### 2. Version enums
 
 ```rust
-pub enum HashVersion { V1 }
-impl HashVersion {
-    pub const CURRENT: HashVersion;
-    pub fn as_str(self) -> &'static str;
-    pub fn parse(s: &str) -> Option<Self>;
-}
+pub enum HashVersion { V1 }          // hash_batch, table_fingerprint, schema_fingerprint,
+                                      // check_equivalence, drop_duplicates
+pub enum NormalizeVersion { V1 }     // normalize_json
+pub enum CleanupVersion { V1 }       // preset, clean_with_preset
 ```
 
-### 3. `ValidateSchemaOptions` and `SchemaDiff`
+Each has `CURRENT`, `as_str(self) -> &'static str`, `parse(s: &str) -> Option<Self>`, and
+implements `Default` (returning `CURRENT`).
 
-```rust
-pub struct ValidateSchemaOptions { pub allow_numeric_widening: bool }
-
-pub struct SchemaDiff {
-    pub missing: Vec<Arc<str>>,
-    pub unexpected: Vec<Arc<str>>,
-    pub retyped: Vec<RetypedColumn>,
-    pub nullability: Vec<NullabilityChange>,
-}
-impl SchemaDiff {
-    pub fn is_empty(&self) -> bool;
-    pub fn is_breaking(&self) -> bool;
-}
-
-pub struct RetypedColumn { pub column: Arc<str>, pub expected: DataType, pub actual: DataType }
-pub struct NullabilityChange { pub column: Arc<str>, pub expected_nullable: bool, pub actual_nullable: bool }
-```
-
-### 4. Module map
+### 3. Module map
 
 <Table 3-1> Public Rust modules
 
@@ -244,24 +306,30 @@ pub struct NullabilityChange { pub column: Arc<str>, pub expected_nullable: bool
 | `witchhat_core::schema` | Re-exported Arrow schema types, `schema_fingerprint` |
 | `witchhat_core::hash` | `HashVersion`, `hash_batch`, `hash_batch_all_columns`, `table_fingerprint` |
 | `witchhat_core::validate` | `ValidateSchemaOptions`, `SchemaDiff`, `RetypedColumn`, `NullabilityChange`, `validate_schema` |
+| `witchhat_core::json` | `NormalizeVersion`, `NormalizeStats`, `normalize_json` |
+| `witchhat_core::clean` | `CleanRule`, `CleanupVersion`, `apply_rules`, `preset`, `clean_with_preset` |
+| `witchhat_core::equivalence` | `EquivalenceOptions`, `EquivalenceReport`, `check_equivalence` |
+| `witchhat_core::dedup` | `drop_duplicates` |
 | `witchhat_core::cpu` | `CpuFeatures`, `features` |
 | `witchhat_core::error` | `Error`, `Result` |
 
-### 5. Error type
+### 4. Error type
 
 `witchhat_core::Error` (`thiserror`-derived, `Clone`, `'static`): `UnknownColumn`,
 `TypeMismatch`, `SchemaMismatch`, `UnsupportedType`, `Config`. See `architecture.md`
-Chapter VII. `validate_schema` does not return `Result`: an unequal schema is a normal
-result (a `SchemaDiff`), not an `Error`.
+Chapter XI. `validate_schema` does not return `Result`: an unequal schema is a normal
+result, not an `Error`. `normalize_json` returns `Result` only for a structural problem
+(an unsupported target type in `schema`), never for a malformed row, which is counted in
+`NormalizeStats` instead.
 
 ## IV. Semantics Callers Must Know
 
 ### 1. Column order
 
 `hash_rows(batch, ["a", "b"])` and `hash_rows(batch, ["b", "a"])` produce different
-fingerprints for the same rows. This is deliberate (`architecture.md` Chapter III,
-Section 1): pick one order and use it consistently for anything comparing fingerprints
-across calls.
+fingerprints for the same rows. Pick one order and use it consistently for anything
+comparing fingerprints across calls. `check_equivalence` is the one function that
+compensates for this automatically across its two inputs; see Section 6.
 
 ### 2. Null and float equality
 
@@ -271,29 +339,37 @@ equal to every other. See `architecture.md` Chapter III, Section 4.
 
 ### 3. Version pinning
 
-Pass `version` explicitly (rather than relying on the `"v1"` default) anywhere a
-fingerprint is stored and compared against a value computed by a different call site or
-a later release, so an accidental version mismatch is visible immediately rather than
-producing a silent, wrong "not equal" result. `validate_schema` has no version parameter:
-schema comparison is a structural check, not a hash, so there is nothing to version yet.
+Pass `version` explicitly (rather than relying on the `"v1"` default) anywhere a result
+is stored and compared against a value computed by a different call site or a later
+release. This applies to `hash_rows`/`table_fingerprint`/`schema_fingerprint`/
+`check_equivalence`/`drop_duplicates` (`HashVersion`), `normalize_json`
+(`NormalizeVersion`), and `clean_with_preset` (`CleanupVersion`). `validate_schema` and
+`clean_with_rules` have no version parameter: the former is a structural check, the
+latter uses the caller's own rules, neither of which witchhat's own versioning applies to.
 
 ### 4. What accepts non-pyarrow objects
 
-`batch`, `row_hashes` and `schema`/`actual`/`expected` parameters accept anything
-implementing the relevant Arrow C Data method (`__arrow_c_array__` or
-`__arrow_c_schema__`), not `pyarrow` specifically: a `polars.DataFrame`'s `to_arrow()`
-result, for instance, satisfies this. witchhat never imports `pyarrow` itself;
-`hash_rows`'s return value and `SchemaDiff.retyped`'s type entries happen to be
-constructed as real `pyarrow` objects because that is what `arrow-rs`'s Python bridge
-produces on the export side.
+Every Arrow-shaped parameter accepts anything implementing the relevant Arrow C Data
+method (`__arrow_c_array__` or `__arrow_c_schema__`), not `pyarrow` specifically: a
+`polars.DataFrame`'s `to_arrow()` result, for instance, satisfies this. witchhat never
+imports `pyarrow` itself; array/batch return values and `SchemaDiff.retyped`'s type
+entries happen to be constructed as real `pyarrow` objects because that is what
+`arrow-rs`'s Python bridge produces on the export side.
 
 ### 5. `validate_schema` argument order
 
-`validate_schema(actual, expected, ...)`: `actual` first, `expected` second, matching
-the reading "validate actual [against] expected". Swapping the two arguments still
-produces a structurally meaningful diff (Rust and Python both accept it without error),
-but `.missing`/`.unexpected` and the direction of `.nullability`'s tightening check flip
-meaning, so a swapped call can silently validate the wrong thing rather than fail loudly.
+`validate_schema(actual, expected, ...)`: `actual` first, `expected` second. Swapping the
+two still produces a structurally meaningful diff without error, but `.missing`/
+`.unexpected` and the nullability-tightening direction flip meaning, so a swapped call
+can silently validate the wrong thing.
+
+### 6. `check_equivalence` is stricter than "not breaking"
+
+`EquivalenceReport.is_equivalent()` requires the schema diff to be entirely empty, not
+just non-breaking: an `actual` with one extra column fails `is_equivalent()` even though
+that same diff would pass `SchemaDiff.is_breaking() == False` on its own. Use
+`validate_schema` directly if "no breaking change" rather than "identical" is the
+question being asked.
 
 ## V. Worked Examples
 
@@ -307,21 +383,19 @@ batch = pa.record_batch({
     "id": pa.array([1, 2, 3, 2]),
     "email": pa.array(["a@x.com", "b@x.com", "c@x.com", "b@x.com"]),
 })
-row_hash = witchhat.hash_rows(batch, ["id", "email"])
-# row_hash[1] == row_hash[3]: rows 1 and 3 are exact duplicates on (id, email)
+deduped = witchhat.drop_duplicates(batch, ["id", "email"])
+# deduped has 3 rows: the second (id=2, email="b@x.com") occurrence is dropped
 ```
 
 ### 2. Checking output against Spark
 
 ```python
-witchhat_rows = witchhat.hash_rows_all_columns(witchhat_batch)
-spark_rows = witchhat.hash_rows_all_columns(spark_result_as_arrow_batch)
-
-assert witchhat.table_fingerprint(witchhat_rows) == witchhat.table_fingerprint(spark_rows)
+report = witchhat.check_equivalence(witchhat_batch, spark_result_as_arrow_batch)
+assert report.is_equivalent(), report
 ```
 
-Works even if the two sides produced their rows in a different order, since
-`table_fingerprint` is order-independent (`architecture.md` Chapter III, Section 5).
+Works even if the two sides produced their rows, or declared their columns, in a
+different order.
 
 ### 3. Validating a batch before processing it
 
@@ -334,11 +408,22 @@ expected_schema = pa.schema([
 diff = witchhat.validate_schema(incoming_batch.schema, expected_schema)
 if diff.is_breaking():
     raise ValueError(f"incoming batch does not match expected schema: {diff!r}")
-if not diff.is_empty():
-    logging.warning("additive schema change: %r", diff.unexpected)
 ```
 
-### 4. Calling from Rust
+### 4. Normalizing JSON, then cleaning a column
+
+```python
+json_col = pa.array(['{"id": 1, "note": "  hi   there  "}'])
+target_schema = pa.schema([pa.field("id", pa.int64()), pa.field("note", pa.string())])
+
+batch, stats = witchhat.normalize_json(json_col, target_schema)
+if stats.rows_malformed:
+    logging.warning("dropped %d malformed rows", stats.rows_malformed)
+
+cleaned_note = witchhat.clean_with_preset(batch.column("note"), "collapse_whitespace")
+```
+
+### 5. Calling from Rust
 
 ```rust
 use witchhat_core::{HashVersion, hash_batch};
@@ -362,4 +447,9 @@ let hashes = hash_batch(&batch, &["id", "email"], HashVersion::CURRENT)?;
 | `table_fingerprint` | `row_hashes` | `version="v1"` |
 | `schema_fingerprint` | `schema` | `version="v1"` |
 | `validate_schema` | `actual`, `expected` | `allow_numeric_widening=False` |
+| `normalize_json` | `json`, `schema` | `version="v1"` |
+| `clean_with_preset` | `input`, `name` | `version="v1"` |
+| `clean_with_rules` | `input`, `rules` | (none) |
+| `check_equivalence` | `actual`, `expected` | `columns=None`, `allow_numeric_widening=False`, `hash_version="v1"` |
+| `drop_duplicates` | `batch`, `columns` | `version="v1"` |
 | `cpu_features` | (none) | (none) |

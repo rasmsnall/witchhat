@@ -229,6 +229,199 @@ def validate_schema(
     SchemaDiff
     """
 
+class NormalizeStats:
+    """What happened while normalizing a batch, beyond the columns themselves.
+
+    Not constructible directly; returned by :func:`normalize_json`.
+    """
+
+    @property
+    def rows_malformed(self) -> int:
+        """Rows whose JSON text did not parse, or parsed to something other than a
+        JSON object. Every target column is null for such a row."""
+
+    @property
+    def type_mismatches(self) -> dict[str, int]:
+        """``{column: count}`` for rows whose JSON value at that column's path had
+        the wrong JSON type (so it was written as null). Does not count an absent
+        path or an explicit JSON ``null``: both are an ordinary, expected null."""
+
+def normalize_json(
+    json: _ArrowArrayExportable,
+    schema: _ArrowSchemaExportable,
+    version: str = "v1",
+) -> tuple["pa.RecordBatch", NormalizeStats]:
+    """Parse ``json``, one JSON object per row, into ``schema``.
+
+    A field's name is a ``.``-separated path into the JSON object
+    (``"address.city"`` reads ``{"address": {"city": ...}}``); a plain name is a
+    top-level key. Supported target types are ``utf8``, ``int64``, ``float64`` and
+    ``boolean``.
+
+    A row whose text fails to parse, or that parses to something other than a JSON
+    object, becomes null in every column and counts toward
+    :attr:`NormalizeStats.rows_malformed`. Within a row, an absent path or an explicit
+    JSON ``null`` becomes an ordinary null; a path present with the wrong JSON type
+    becomes null and counts in :attr:`NormalizeStats.type_mismatches` for that column.
+
+    Parameters
+    ----------
+    json:
+        A ``utf8`` array of JSON text, one row per element. A null element is treated
+        like unparseable text (malformed).
+    schema:
+        The target schema. Field names may be dotted paths; see above.
+    version:
+        The parsing ruleset to use, by name. ``"v1"`` (the default) is the only
+        version implemented so far.
+
+    Returns
+    -------
+    tuple[pyarrow.RecordBatch, NormalizeStats]
+
+    Raises
+    ------
+    RuntimeError
+        A field in ``schema`` is not one of the four supported types.
+    """
+
+def clean_with_preset(
+    input: _ArrowArrayExportable,
+    name: str,
+    version: str = "v1",
+) -> "pa.Array":
+    """Apply a named, built-in cleanup preset to ``input``.
+
+    Presets defined by ``version="v1"`` (the only version implemented so far):
+    ``trim_whitespace``, ``collapse_whitespace``, ``strip_control_characters``,
+    ``strip_non_alphanumeric``, ``digits_only``. See the Rust ``clean::preset`` docs
+    for exactly what each one does.
+
+    Parameters
+    ----------
+    input:
+        A ``utf8`` array. A null element stays null.
+    name:
+        The preset name.
+    version:
+        The preset set to use, by name.
+
+    Returns
+    -------
+    pyarrow.Array
+
+    Raises
+    ------
+    ValueError
+        ``name`` or ``version`` is not recognised.
+    """
+
+def clean_with_rules(
+    input: _ArrowArrayExportable,
+    rules: list[tuple[str, str]],
+) -> "pa.Array":
+    """Apply caller-supplied regex find-and-replace rules to ``input``, in order.
+
+    Each rule is ``(pattern, replacement)``; ``replacement`` follows the Rust
+    ``regex`` crate's syntax (``$1``, ``${name}`` for capture groups, ``$$`` for a
+    literal ``$``). Unlike :func:`clean_with_preset`, these rules are the caller's
+    own and are not versioned by witchhat.
+
+    Raises
+    ------
+    ValueError
+        A pattern does not compile.
+    """
+
+class EquivalenceReport:
+    """The result of comparing an actual batch against an expected one.
+
+    Not constructible directly; returned by :func:`check_equivalence`.
+    """
+
+    @property
+    def schema_diff(self) -> SchemaDiff:
+        """The schema half of the comparison."""
+
+    @property
+    def row_count_actual(self) -> int: ...
+    @property
+    def row_count_expected(self) -> int: ...
+    @property
+    def table_fingerprint_actual(self) -> int:
+        """Order-independent fingerprint of the actual batch's rows over the
+        compared columns."""
+
+    @property
+    def table_fingerprint_expected(self) -> int:
+        """Order-independent fingerprint of the expected batch's rows over the
+        compared columns."""
+
+    @property
+    def fingerprints_match(self) -> bool: ...
+    def is_equivalent(self) -> bool:
+        """Whether the two batches are equivalent: empty schema diff, matching row
+        counts, and matching table fingerprints. Stricter than
+        ``schema_diff.is_breaking()``: an extra column alone fails this, unlike a
+        breaking-change check."""
+
+def check_equivalence(
+    actual: _ArrowArrayExportable,
+    expected: _ArrowArrayExportable,
+    columns: list[str] | None = None,
+    allow_numeric_widening: bool = False,
+    hash_version: str = "v1",
+) -> EquivalenceReport:
+    """Compare ``actual`` against ``expected``: same schema, same row count, same
+    rows regardless of order.
+
+    Parameters
+    ----------
+    actual, expected:
+        The two batches to compare, e.g. witchhat's output and Spark's.
+    columns:
+        Which columns to fingerprint, in that order. ``None`` (the default) uses
+        every column ``expected`` and ``actual`` have in common, in ``expected``'s
+        order, so a column declared in a different position on each side does not by
+        itself cause a mismatch. A column whose *type* differs still does.
+    allow_numeric_widening:
+        Passed through to the schema comparison; see :func:`validate_schema`.
+    hash_version:
+        The row-hashing algorithm to use, by name.
+
+    Returns
+    -------
+    EquivalenceReport
+
+    Raises
+    ------
+    RuntimeError
+        A name in ``columns`` is absent from ``actual`` or ``expected``, or a
+        compared column's Arrow type has no defined hash.
+    ValueError
+        ``hash_version`` does not name a known hashing algorithm.
+    """
+
+def drop_duplicates(
+    batch: _ArrowArrayExportable,
+    columns: list[str],
+    version: str = "v1",
+) -> "pa.RecordBatch":
+    """Keep the first row of every distinct value of ``columns`` in ``batch``,
+    dropping the rest, preserving the relative order of the rows that remain.
+
+    Equivalent to Spark's ``df.dropDuplicates(subset=columns)``, except which row
+    within a duplicate group survives is always the first one by input order.
+
+    Raises
+    ------
+    ValueError
+        ``version`` does not name a known hashing algorithm.
+    RuntimeError
+        A name in ``columns`` is not in ``batch``'s schema, or a requested column's
+        Arrow type has no defined hash.
+    """
+
 def cpu_features() -> CpuFeatures:
     """Detect the CPU features of the machine running this process.
 

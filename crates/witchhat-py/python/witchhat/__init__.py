@@ -10,6 +10,21 @@ Schema validation: :func:`validate_schema` compares an actual schema against an 
 one and returns a :class:`SchemaDiff` describing exactly how they differ (missing,
 unexpected, retyped or renullable columns), rather than a bare yes/no.
 
+JSON normalization: :func:`normalize_json` parses a column of JSON strings into a fixed
+Arrow schema, returning both the batch and a :class:`NormalizeStats` reporting malformed
+rows and type mismatches.
+
+Regex cleanup: :func:`clean_with_preset` applies one of witchhat's named, versioned
+presets to a string column; :func:`clean_with_rules` applies caller-supplied
+find-and-replace rules directly.
+
+Output equivalence testing: :func:`check_equivalence` compares two batches (schema, row
+count, and an order-independent fingerprint of their rows) and returns an
+:class:`EquivalenceReport`.
+
+Native transformations: :func:`drop_duplicates` is the first one, equivalent to Spark's
+``dropDuplicates``.
+
 :func:`cpu_features` reports what SIMD dispatch this machine would get from a future
 accelerated kernel.
 
@@ -19,10 +34,17 @@ Every function accepts any object implementing the Arrow C Data / pyarrow interf
 
 from ._witchhat import (
     CpuFeatures,
+    EquivalenceReport,
+    NormalizeStats,
     SchemaDiff,
+    check_equivalence,
+    clean_with_preset,
+    clean_with_rules,
     cpu_features,
+    drop_duplicates,
     hash_rows,
     hash_rows_all_columns,
+    normalize_json,
     schema_fingerprint,
     table_fingerprint,
     validate_schema,
@@ -35,6 +57,13 @@ __all__ = [
     "schema_fingerprint",
     "validate_schema",
     "SchemaDiff",
+    "normalize_json",
+    "NormalizeStats",
+    "clean_with_preset",
+    "clean_with_rules",
+    "check_equivalence",
+    "EquivalenceReport",
+    "drop_duplicates",
     "cpu_features",
     "CpuFeatures",
 ]

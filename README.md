@@ -52,6 +52,20 @@ witchhat.cpu_features()
 diff = witchhat.validate_schema(batch.schema, expected_schema)
 if diff.is_breaking():
     raise ValueError(f"schema mismatch: {diff!r}")
+
+# JSON -> a fixed schema, one level of nested-object flattening
+records, stats = witchhat.normalize_json(json_column, target_schema)
+
+# regex cleanup: a named preset, or your own rules
+witchhat.clean_with_preset(batch.column("note"), "collapse_whitespace")
+witchhat.clean_with_rules(batch.column("phone"), [(r"[^0-9]", "")])
+
+# compare witchhat's output against Spark's, order-independent
+report = witchhat.check_equivalence(witchhat_batch, spark_batch)
+assert report.is_equivalent()
+
+# the first native transformation: dropDuplicates, built on hash_rows
+witchhat.drop_duplicates(batch, ["id", "email"])
 ```
 
 `batch` can be anything that implements the Arrow C Data / pyarrow interface
@@ -100,29 +114,55 @@ can distinguish a breaking change from additive schema evolution instead of
 being told only "matches" or "doesn't". See
 [`crates/witchhat-core/src/validate.rs`](crates/witchhat-core/src/validate.rs).
 
+**Malformed is counted, not hidden.** [`normalize_json`] parses one JSON
+object per row into a fixed schema; a row that fails to parse becomes null
+and is counted in `NormalizeStats.rows_malformed` rather than failing the
+whole batch, and a value of the wrong JSON type is counted separately from
+an ordinary absent key. See
+[`crates/witchhat-core/src/json.rs`](crates/witchhat-core/src/json.rs).
+
+**Only witchhat's own named behaviour is versioned.** [`clean_with_preset`]
+looks up one of witchhat's own frozen rule sets by name; a caller's own
+regex, passed to [`apply_rules`] directly, is the caller's algorithm and
+isn't versioned by witchhat at all. See
+[`crates/witchhat-core/src/clean.rs`](crates/witchhat-core/src/clean.rs).
+
+**Equivalence testing reuses hashing and validation, not a third algorithm.**
+[`check_equivalence`] combines `validate_schema` (schema agreement) with
+`table_fingerprint` over a shared column order (row-set agreement) into one
+`EquivalenceReport`, deliberately stricter than "not breaking": an extra
+column fails equivalence even though it wouldn't fail schema validation. See
+[`crates/witchhat-core/src/equivalence.rs`](crates/witchhat-core/src/equivalence.rs).
+
+**Deduplication builds on hashing instead of reinventing row comparison.**
+[`drop_duplicates`] is the first native transformation, equivalent to
+Spark's `dropDuplicates`: one pass with `hash_batch` as the dedup key.
+Filter and project were left to Arrow's own compute kernels, which already
+do the job with nothing witchhat-specific to add. See
+[`crates/witchhat-core/src/dedup.rs`](crates/witchhat-core/src/dedup.rs).
+
 ## Not built yet
 
-The core data model, composite row hashing, and schema validation are done.
-Ordered by what the stated goal needs next:
+Composite hashing, schema validation, JSON normalization, regex cleanup,
+output-equivalence testing, and deduplication are done. Ordered by what the
+stated goal needs next:
 
-1. **JSON normalization.** Flatten/normalize nested JSON columns into a
-   fixed Arrow schema, the usual first step before anything else in the
-   pipeline can run.
-2. **Regex-heavy cleanup.** A transform kernel for the regex-based
-   normalization rules that currently live in Spark UDFs, with the same
-   versioning discipline as hashing.
-3. **Output equivalence testing.** A harness built on `table_fingerprint`
-   plus per-column diffing, so a witchhat pipeline and its Spark equivalent
-   can be asserted equal in CI.
-4. **Native transformations.** The actual replacements for Spark operations
-   (filter/project/join/aggregate paths), the point of the exercise.
-5. **Reproducible-build check.** manylinux abi3 wheel build + CI are done (see
+1. **Join and aggregate.** The two relational operations still needed for
+   "native transformations" to be a real Spark replacement. Filter and
+   project already exist as Arrow compute kernels with nothing
+   witchhat-specific to add.
+2. **Reproducible-build check.** manylinux abi3 wheel build + CI are done (see
    `.github/workflows/ci.yml`); still need a same-inputs -> byte-identical-wheel check.
-6. **Publish to a package repository.** Currently wheel-only, no index; see
-   `docs/operations.md` Chapter III.
-7. **Databricks Volumes distribution.** Confirm `pip install` from a Unity
-   Catalog volume path works with the abi3 wheel as built (documented as the intended
-   path in `docs/operations.md`, not yet verified against a real workspace).
+3. **Publish to a package repository.** Needs a PyPI (or internal index)
+   account and an upload credential this repository's automation does not
+   hold; a package upload is one-way, so this is left to a human running it
+   deliberately rather than attempted by default. See `docs/operations.md`
+   Chapter VI, Section 2 for what's needed before this can happen.
+4. **Databricks Volumes distribution — verify, not just document.** The
+   `/Volumes/...` install path is written up in `docs/operations.md`
+   Chapter III, but has not been run against a real Databricks workspace;
+   this development environment has none. See `docs/operations.md`
+   Chapter VI, Section 2.
 
 Type hints and generated docs (`.pyi` stubs, `py.typed`, `docs/*.md` + generated
 `.docx`) are done; see the Documentation section above.
@@ -133,12 +173,14 @@ Type hints and generated docs (`.pyi` stubs, `py.typed`, `docs/*.md` + generated
 cargo test --workspace
 ```
 
-20 unit tests plus 7 doctests, all in `witchhat-core`: hash determinism, column-order
-sensitivity, null-vs-value distinctness, type-tag collision avoidance, float
-canonicalization (NaN, -0.0), unknown-column errors, order-independent table
-fingerprints, schema-fingerprint sensitivity to field order/type/nullability, and
-schema-diff correctness (missing/unexpected/retyped/nullability, numeric widening
-opt-in, narrowing and cross-signedness always rejected).
+49 unit tests plus 12 doctests, all in `witchhat-core`, covering: hash determinism,
+column-order sensitivity, null-vs-value distinctness, type-tag collision avoidance,
+float canonicalization; schema-diff correctness (missing/unexpected/retyped/nullability,
+numeric widening opt-in); JSON normalization (malformed rows, type mismatches, absent
+vs. explicit-null, nested-path extraction); regex cleanup (every built-in preset, rule
+ordering, invalid-pattern rejection); output equivalence (identical, reordered,
+different-value, different-row-count, column-order-independent, explicit-column-subset
+batches); and deduplication (first-occurrence order, composite keys, unknown columns).
 `cargo doc --no-deps -p witchhat-core` and `cargo clippy --workspace --all-targets`
 both run clean with warnings denied (`missing_docs`, `broken_intra_doc_links`, clippy's
 default lint set); see `.github/workflows/ci.yml`.

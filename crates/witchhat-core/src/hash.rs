@@ -30,9 +30,10 @@ use crate::error::{Error, Result};
 /// improvement to the algorithm ships as a new variant, so a fingerprint computed under
 /// `"v1"` today is still reproducible under `"v1"` next year, and code that needs the old
 /// behaviour can keep asking for it explicitly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum HashVersion {
     /// The first hashing algorithm. See [`hash_batch`] for what it computes.
+    #[default]
     V1,
 }
 
