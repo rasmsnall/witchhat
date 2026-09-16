@@ -5,8 +5,9 @@ Spark/Databricks workloads. Status: **eight kernels implemented end to end** (co
 hashing, schema validation, JSON normalization, regex cleanup, output-equivalence
 testing, deduplication, join, aggregate). Filter/project need no witchhat kernel (Arrow's
 own compute kernels already cover them). Remaining open items are broader `aggregate`
-type support, deeper JSON normalization, and two items blocked on the user (package-repo
-publishing, Databricks Volumes verification) — see "Open items" below.
+type support and deeper JSON normalization; package-repo publishing and live Databricks
+Volumes verification were raised and explicitly closed as not pursued (see "Open items"
+below).
 
 ## Goals / constraints (from the user, verbatim intent)
 
@@ -213,15 +214,14 @@ Still open:
   aggregation are unbuilt (`Sum`/`Mean`/`Min`/`Max` are numeric-only today).
 - Deeper JSON normalization: array-valued fields and more than one level of object
   nesting are unbuilt (fall into the type-mismatch case in `normalize_json` today).
-- Publishing to a package repository. **Blocked on the user, not on more code**: needs a
-  PyPI (or internal index) account and an upload credential this repository's automation
-  does not hold. A package upload is one-way (cannot be un-published, only yanked), so
-  this should not be attempted without the user explicitly providing credentials and
-  confirming the target index. See `docs/operations.md` Chapter VI, Section 2.
-- Verifying installation from a Databricks Unity Catalog Volume against a real
-  workspace. **Blocked on the user, not on more code**: this development environment has
-  no Databricks workspace to test against. The `/Volumes/...` install procedure is
-  documented in `docs/operations.md` Chapter III as the intended path, but unconfirmed.
+- **Closed, not open**: publishing to a package repository, and live-verifying
+  installation from a Databricks Unity Catalog Volume. Both were raised, then the user
+  explicitly said to skip package-repo publishing and to leave Volumes install as
+  documented rather than pursued (2026-09-16). The project stays wheel-only; the
+  `/Volumes/...` install path is documented in `docs/operations.md` Chapter III as the
+  standard, sufficient Databricks procedure, not something this repository verifies
+  live. See `docs/operations.md` Chapter VI, Section 2 for the reasoning. Do not
+  re-open either as a backlog item without the user asking again.
 - Whether/when a kernel becomes expensive enough to justify releasing the GIL
   (`docs/architecture.md` Chapter XII); none does yet, though JSON normalization and
   regex cleanup are the most CPU-intensive kernels so far per input byte

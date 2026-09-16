@@ -4,7 +4,7 @@
 **Status** Eight kernels (composite hashing, schema validation, JSON normalization, regex cleanup, output-equivalence testing, deduplication, join, aggregate) are implemented end to end, behind both the Rust and the Python surface. Filter and project need no witchhat-specific kernel (Arrow's own compute kernels already cover them); see Chapter XVIII for what remains.
 **Audience** Anyone integrating, operating, or extending this library. No prior context assumed.
 **Companion documents** `api.md` for the callable surface, `operations.md` for building and deploying it.
-**Version** 1.3
+**Version** 1.4
 **Date** 2026-09-16
 
 ---
@@ -718,15 +718,16 @@ output-equivalence testing, deduplication, join (inner/left/right/full), aggrega
 (count/sum/mean/min/max), CPU feature detection, the Python binding boundary, the
 `abi3-py310` wheel build.
 
-Open, tracked separately from the Rust/Python surface itself because neither is a matter
-of more code: publishing to a package repository (needs credentials this repository's
-automation does not have) and verifying installation from a Unity Catalog Volume against
-a real Databricks workspace (needs access this development environment does not have);
-see `docs/operations.md` Chapter VI for both. Also open: broader `aggregate` type
-support (Section 2 above), and array-valued/deeper-nested JSON (Chapter V, Section 3).
-See the repository `README.md` for the up-to-date backlog; this document describes the
-architecture of what exists, and is expected to gain chapters as each item lands rather
-than being rewritten from scratch.
+Publishing to a package repository and verifying installation from a Unity Catalog
+Volume against a live workspace were both raised and then deliberately decided against
+pursuing further (2026-09-16): the project stays wheel-only, and the Volumes install
+path is documented as the standard, sufficient procedure rather than something this
+repository additionally verifies live; see `docs/operations.md` Chapter VI, Section 2
+for the reasoning. Still open: broader `aggregate` type support (Section 2 above), and
+array-valued/deeper-nested JSON (Chapter V, Section 3). See the repository `README.md`
+for the up-to-date backlog; this document describes the architecture of what exists, and
+is expected to gain chapters as each item lands rather than being rewritten from
+scratch.
 
 ## References
 

@@ -4,7 +4,7 @@
 **Status** Partial by necessity: witchhat is a stateless transformation library today, with no write path, no job to schedule, and no storage of its own. This document covers what already applies (build, install, sizing) and defers what does not yet (Chapter VI).
 **Audience** Whoever builds the wheel and installs it on a Databricks workspace.
 **Companion documents** `architecture.md` for the design, `api.md` for the callable surface.
-**Version** 1.3
+**Version** 1.4
 **Date** 2026-09-16
 
 ---
@@ -22,7 +22,6 @@
   - 1. From a Unity Catalog Volume
   - 2. From a package repository
   - 3. Compatibility floor
-  - 4. What is documented but not verified
 - IV. Sizing
   - 1. What scales and what does not
   - 2. Memory
@@ -37,7 +36,7 @@
   - 2. What cannot fail
 - VI. Deferred Until Applicable
   - 1. Deferred because the feature does not exist yet
-  - 2. Deferred pending access this environment does not have
+  - 2. Decided out of scope, documented rather than pursued
 - References
 - Appendix A. Reproducing a build
 
@@ -107,27 +106,34 @@ exported function (`tools/smoke.py`) before publishing it as an artifact.
 
 | Source | When to use |
 |---|---|
-| Unity Catalog Volume (`/Volumes/...`) | The wheel was built in-house and is not meant to be public |
-| A package repository (internal PyPI-compatible index, or public PyPI once published) | The wheel should be installable by name, like any other dependency |
+| Unity Catalog Volume (`/Volumes/...`) | The intended, primary path: install a built wheel from where it was uploaded |
+| A package repository | Not pursued for this project; see Section 2 |
 
 ### 1. From a Unity Catalog Volume
 
-Upload the built `.whl` to a Volume path, then either install it as a cluster library
-(Compute -> Libraries -> Install new -> Volumes) or, inside a notebook:
+The primary distribution path. Upload the built `.whl` to a Volume path, then either
+install it as a cluster library (Compute -> Libraries -> Install new -> Volumes) or,
+inside a notebook:
 
 ```python
 %pip install /Volumes/<catalog>/<schema>/<volume>/witchhat-0.1.0-cp310-abi3-manylinux_2_28_x86_64.whl
 ```
 
+This is the standard Databricks pattern for installing a wheel from a Volume path, not
+anything witchhat-specific, and is documented here as the complete, intended procedure.
+`tools/smoke.py` and CI's `wheel` job already confirm the wheel itself is correct
+(imports cleanly, carries the `cp310-abi3` tag, every function round-trips against real
+`pyarrow`); the `/Volumes/...` filesystem mechanism above it is Databricks' own,
+well-established behaviour, so this repository does not additionally verify it against
+a live workspace (decided 2026-09-16, see Chapter VI, Section 2).
+
 ### 2. From a package repository
 
-Once published to an index Databricks can reach, `%pip install witchhat` (or a cluster
-library entry naming the package) works like any other PyPI dependency. Not yet done:
-publishing needs a PyPI (or internal index) account and an upload credential this
-repository's automation does not hold, and pushing a public package version is a
-one-way action (a bad upload cannot be un-published, only yanked), so it is deliberately
-left to a human running it deliberately rather than attempted by default. See
-Chapter VI for what is needed before this can happen.
+Deliberately not pursued: `%pip install witchhat` by name would need publishing to an
+index Databricks can reach (public PyPI, or an internal one), which needs an account and
+upload credential this repository's automation does not hold, and is a one-way action (a
+bad upload cannot be un-published, only yanked). The project stays wheel-only,
+distributed via Section 1 instead. See Chapter VI, Section 2 for the decision.
 
 ### 3. Compatibility floor
 
@@ -135,16 +141,6 @@ The `abi3-py310` build loads on every CPython from 3.10 onward, which covers eve
 Databricks Runtime in current use as of this document's date. A manylinux 2_28 wheel
 requires a correspondingly recent glibc on the cluster's base image, which every current
 DBR image satisfies.
-
-### 4. What is documented but not verified
-
-Section 1's Volume-install command has not been run against a real Databricks
-workspace: this development environment has no workspace to test against. `tools/
-smoke.py` exercises every function against a real `pyarrow` install and CI's `wheel`
-job proves the wheel itself installs and imports correctly on Linux, but neither
-confirms the `/Volumes/...` FUSE path behaves as documented on an actual cluster.
-Treat Section 1 as the intended procedure, not a confirmed one, until someone with
-workspace access runs it once and this section is updated to say so.
 
 ## IV. Sizing
 
@@ -238,9 +234,9 @@ failure surfaces from the surrounding Spark/Databricks job instead.
 
 ## VI. Deferred Until Applicable
 
-Two kinds of "deferred" live here: features that do not exist yet, and steps that exist
-and are documented but cannot be completed by this repository's own automation because
-they need something only a human with the right access can provide.
+Two kinds of "deferred" live here: features that do not exist yet, and steps that were
+raised, then deliberately decided against pursuing further, in favour of documenting the
+intended approach instead.
 
 ### 1. Deferred because the feature does not exist yet
 
@@ -258,25 +254,28 @@ absent here (`architecture.md` Chapter XVIII has the full backlog):
 
 Revisit as each corresponding backlog item in `architecture.md` Chapter XVIII lands.
 
-### 2. Deferred pending access this environment does not have
+### 2. Decided out of scope, documented rather than pursued
 
-- **Publishing to a package repository** (Chapter III, Section 2). Needs a PyPI (or
-  internal index) account and an upload token; an automated agent building this project
-  does not hold one and should not be given one implicitly, since a package upload is a
-  one-way, externally-visible action. Before this can happen: decide which index
-  (public PyPI, or an internal one Databricks can already reach), create or provide the
-  account/token, and decide whether publishing happens by hand or is wired into CI
-  (e.g. a tag-triggered release job using PyPI's trusted-publisher OIDC flow, which
-  needs no long-lived token stored in the repository, is the lower-risk option if CI
-  publishing is wanted).
-- **Verifying installation from a Unity Catalog Volume** (Chapter III, Section 4).
-  Needs a reachable Databricks workspace with Volumes enabled; this development
-  environment has none. Before this can happen: run the Section 1 command (or the
-  cluster-library UI flow) against a real workspace once, and update Section 4 to
-  record that it was confirmed, on what DBR version, and by whom.
+Two more items that a conventional operations manual would chase down were raised and
+then explicitly descoped by the user (2026-09-16), rather than left as open work:
 
-Both are the two open items in `README.md`'s backlog that are not a matter of writing
-more code.
+- **Publishing to a package repository** (Chapter III, Section 2). Not pursued: the
+  project is wheel-only, installed from a built artifact (a Unity Catalog Volume, or by
+  handing the `.whl` to whoever needs it) rather than `pip install witchhat` by name.
+  Section 2 above still describes what publishing would look like if that changes later,
+  but nothing here is waiting on it.
+- **Verifying Unity Catalog Volume installation against a live workspace**
+  (Chapter III, Section 1). Not pursued as a live check: Section 1's procedure is the
+  documented, standard Databricks pattern for installing a wheel from a Volume path
+  (`%pip install /Volumes/...` or the cluster-library UI), and that documentation is
+  considered sufficient on its own rather than something this repository needs to prove
+  against a real cluster. `tools/smoke.py` and CI's `wheel` job already confirm the
+  wheel itself is correct (imports, `cp310-abi3` tag, every function round-trips against
+  real `pyarrow`); what remained unverified was only the Volumes *filesystem* path
+  specifically, which is standard Databricks behaviour rather than anything
+  witchhat-specific.
+
+Neither is tracked as an open item in `README.md` any longer.
 
 ## References
 

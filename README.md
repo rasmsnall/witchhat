@@ -166,21 +166,18 @@ What's left:
 
 1. **Reproducible-build check.** manylinux abi3 wheel build + CI are done (see
    `.github/workflows/ci.yml`); still need a same-inputs -> byte-identical-wheel check.
-2. **Publish to a package repository.** Needs a PyPI (or internal index)
-   account and an upload credential this repository's automation does not
-   hold; a package upload is one-way, so this is left to a human running it
-   deliberately rather than attempted by default. See `docs/operations.md`
-   Chapter VI, Section 2 for what's needed before this can happen.
-3. **Databricks Volumes distribution — verify, not just document.** The
-   `/Volumes/...` install path is written up in `docs/operations.md`
-   Chapter III, but has not been run against a real Databricks workspace;
-   this development environment has none. See `docs/operations.md`
-   Chapter VI, Section 2.
-4. **Broader `aggregate` type support.** `Sum`/`Mean`/`Min`/`Max` are numeric-only
+2. **Broader `aggregate` type support.** `Sum`/`Mean`/`Min`/`Max` are numeric-only
    today (no string min/max, no `Decimal`/`Date`/`Time`/`Timestamp` aggregation).
-5. **Deeper JSON normalization.** `normalize_json` supports one level of
+3. **Deeper JSON normalization.** `normalize_json` supports one level of
    nested-object flattening; array-valued fields and deeper nesting are not
    yet handled.
+
+Package-repository publishing and live Databricks Volumes verification were
+raised and deliberately decided against (2026-09-16): the project stays
+wheel-only, and the Volumes install path (`docs/operations.md` Chapter III)
+is documented as the standard, sufficient procedure rather than something
+verified against a live workspace. See `docs/operations.md` Chapter VI,
+Section 2 for the reasoning.
 
 Type hints and generated docs (`.pyi` stubs, `py.typed`, `docs/*.md` + generated
 `.docx`) are done; see the Documentation section above.
