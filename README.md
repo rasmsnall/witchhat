@@ -30,6 +30,11 @@ extension): the Databricks/Spark integration layer, calling the compiled functio
 from `pyspark.sql.DataFrame.mapInArrow`. Lazily imports pyspark, so it never affects
 `import witchhat` outside Databricks.
 
+`crates/witchhat-py/python/witchhat/metrics.py` is also pure Python, stdlib only:
+opt-in, disabled-by-default JSON event logging (latency, row counts, throughput) wrapped
+around every exported function at the `__init__.py` boundary, so `witchhat.spark` gets it
+for free.
+
 `rust-toolchain.toml` pins the Rust toolchain (rustc/rustfmt/clippy) so CI and a
 developer's machine agree. `tools/smoke.py` round-trips a real pyarrow batch through the
 built wheel; `tools/spark_smoke.py` does the same for `witchhat.spark` against a real
@@ -191,8 +196,9 @@ witchhat (not a distributed engine) cannot do; see
 ## Not built yet
 
 Composite hashing, schema validation, JSON normalization, regex cleanup,
-output-equivalence testing, deduplication, join, aggregate, and a
-Databricks/Spark integration layer (`witchhat.spark`) are done. What's left:
+output-equivalence testing, deduplication, join, aggregate, a
+Databricks/Spark integration layer (`witchhat.spark`), and opt-in JSON metric
+logging (`witchhat.metrics`) are done. What's left:
 
 1. **Reproducible-build check.** manylinux abi3 wheels build + CI for both
    `x86_64` and `aarch64` (Graviton) (see `.github/workflows/ci.yml`); still
@@ -217,6 +223,17 @@ Section 2 for the reasoning.
 
 Type hints and generated docs (`.pyi` stubs, `py.typed`, `docs/*.md` + generated
 `.docx`) are done; see the Documentation section above.
+
+## Known correctness gaps
+
+An external code review (2026-09-16) found real correctness issues in code that was
+already implemented and only documented as a caveat, not fixed: `drop_duplicates` treats
+a hash collision as row equality; `witchhat.spark.broadcast_join`'s `"right"`/`"full"`
+modes are unsound under per-partition broadcast; `join` likely treats two null keys as
+matching, unlike Spark; `aggregate` accumulates `Sum`/`Mean` and compares `Min`/`Max`
+through `f64`, losing precision beyond ±2^53; PyO3 bindings never release the GIL during
+kernel execution. None of these are fixed yet. See `CLAUDE.md`'s "Open items" for the
+full list, including lower-priority findings from the same review.
 
 ## Tests
 

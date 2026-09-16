@@ -5,10 +5,21 @@ Spark/Databricks workloads. Status: **eight kernels implemented end to end** (co
 hashing, schema validation, JSON normalization, regex cleanup, output-equivalence
 testing, deduplication, join, aggregate), plus a pure-Python `witchhat.spark` layer
 bridging them to `pyspark.sql.DataFrame`, plus `aarch64` (Graviton) wheels alongside
-`x86_64` in CI. Filter/project need no witchhat kernel (Arrow's own compute kernels
-already cover them). Remaining open items are broader `aggregate` type support and
-deeper JSON normalization; package-repo publishing and live Databricks Volumes
-verification were raised and explicitly closed as not pursued (see "Open items" below).
+`x86_64` in CI, plus opt-in JSON metric logging (`witchhat.metrics`) wrapping every
+kernel including through `witchhat.spark`. Filter/project need no witchhat kernel
+(Arrow's own compute kernels already cover them). Remaining open items are broader
+`aggregate` type support and deeper JSON normalization; package-repo publishing and live
+Databricks Volumes verification were raised and explicitly closed as not pursued (see
+"Open items" below).
+
+A round of external code review on 2026-09-16 raised concrete correctness gaps in
+several of the "resolved and shipped" items below (dedup hash-collision risk,
+`broadcast_join` right/full semantics, join null-key semantics, aggregate `f64`
+precision, PyO3 GIL retention, plus several lower-priority items: partition-buffering
+memory, equivalence testing being probabilistic-only, Rust-vs-Spark regex dialect,
+unproven Spark-integration performance/CI coverage, `panic = "abort"` worker safety,
+artifact provenance). These are real, not yet fixed; treat "resolved and shipped" below
+as "implemented", not "reviewed for correctness against Spark's semantics".
 
 ## Goals / constraints (from the user, verbatim intent)
 
@@ -65,6 +76,7 @@ crates/witchhat-py/python/witchhat/__init__.py    re-exports _witchhat, __all__,
 crates/witchhat-py/python/witchhat/__init__.pyi   type stubs, one docstring per export
 crates/witchhat-py/python/witchhat/py.typed
 crates/witchhat-py/python/witchhat/spark.py       pure Python, no Rust: mapInArrow bridge to pyspark
+crates/witchhat-py/python/witchhat/metrics.py     pure Python, stdlib only: opt-in JSON latency/throughput logging
 crates/witchhat-py/pyproject.toml      maturin config (abi3-py310, mixed layout)
 rust-toolchain.toml   pins rustc/rustfmt/clippy to one version
 README.md
@@ -74,6 +86,7 @@ docs/operations.md
 tools/md2docx.py      generates docs/*.docx from docs/*.md
 tools/smoke.py        round-trips a real pyarrow batch through the built wheel, every function
 tools/spark_smoke.py  same, for witchhat.spark, against a real local pyspark session
+tools/metrics_smoke.py  verifies witchhat.metrics event shape/enable-disable against the built wheel
 .github/workflows/ci.yml   fmt+clippy+test+doc job, manylinux abi3 wheel matrix (x86_64+aarch64), multi-interpreter matrix
 ```
 
@@ -243,8 +256,60 @@ Resolved and shipped:
   `tools/spark_smoke.py`.
 - ARM64 wheel: CI now builds and verifies `aarch64` alongside `x86_64`, both on native
   runners (see "CI" above).
+- Metric logging (`metrics.py`): opt-in, disabled by default, zero overhead when off.
+  `enable(sink=...)`/`disable()`/`is_enabled()` plus a `measure()` context manager
+  emitting one flat JSON event per call (`function`, `ts`, `status`, `duration_ms`,
+  `rows_in`/`rows_out`/`rows_per_second` where applicable, caller context; errors record
+  `status: "error"` and `f"{type(exc).__name__}: {exc}"`, never a full traceback, so a
+  row-derived value can't leak into a log sink). Wrapped at the `__init__.py` boundary
+  around every kernel, so `witchhat.spark` inherits it transitively without its own
+  instrumentation code. `tools/metrics_smoke.py` verifies event shape and the
+  enable/disable toggle against the built wheel; wired into CI's wheel round-trip step.
 
-Still open:
+Still open, correctness gaps raised by external review (2026-09-16), highest priority
+first, none fixed yet:
+
+- **`drop_duplicates` trusts a hash collision as equality** (`dedup.rs`): rows are
+  deduplicated by `hash_batch`'s `u64` fingerprint alone; a collision would silently drop
+  a distinct, valid row instead of only a true duplicate. Needs a fallback exact-equality
+  check (e.g. `arrow_row::RowConverter`, as `join`/`aggregate` already use) within a hash
+  bucket before treating two rows as the same.
+- **`broadcast_join`'s `"right"`/`"full"` are unsound** (`spark.py`): `small_table` is
+  broadcast independently to every partition, so an unmatched right-side row surfaces
+  once *per partition* instead of once overall. Currently only documented as a caveat in
+  the docstring, not prevented. Fix: either restrict `how` to `"inner"`/`"left"` (raise
+  for `"right"`/`"full"`), or build a separate, properly partition-coordinated algorithm.
+- **`join` null-key semantics probably differ from Spark** (`join.rs`): keys are matched
+  via `arrow_row::RowConverter`'s byte-exact row encoding with no explicit null handling,
+  which likely treats two null keys as equal; Spark/SQL semantics say `NULL` never equals
+  `NULL`. Fix: exclude null keys from matching in the default join mode, and add a
+  separate, explicitly opt-in null-safe join mode for callers who want null-equals-null.
+- **`aggregate` loses numeric precision through `f64`** (`aggregate.rs`): `Sum`/`Mean`
+  accumulate through `f64` (documented ±2^53 caveat) and `Min`/`Max` locate the extreme
+  row by comparing through `f64` too (`extract_f64`), so two distinct large integers could
+  compare equal before the original value is `take`n back out. User-specified fix: type
+  specific accumulation/comparison, not a universal `f64` downcast — `i128`/`u128` for
+  integers, `Decimal128`/`Decimal256` for decimals, `f64` only for actual floats, native
+  integer representation for date/time.
+- **PyO3 bindings never release the GIL** (`witchhat-py/src/python.rs`): every
+  `#[pyfunction]` calls its Rust kernel synchronously while holding the GIL, blocking
+  every other Python thread for the whole kernel call. Fix: extract the Arrow-owned
+  input, run the kernel inside `Python::allow_threads` (pyo3 0.25.1's name for this;
+  `Python::detach` is a 0.29+ rename, do not use it against this pinned version), and
+  reacquire the GIL only to construct the returned Python object.
+- Lower priority, same review round, not yet triaged into concrete fixes: whole Spark
+  partitions are buffered in memory (`drop_duplicates`/`aggregate` in `spark.py`, via
+  `pa.concat_batches`) rather than streamed; `check_equivalence` is fingerprint-only
+  (probabilistic), with no `exact` mode (schema + sorted/full row comparison); Rust's
+  `regex` crate syntax is not Spark/Java regex syntax and the gap is undocumented; no
+  benchmark proves Spark-side wins net of JVM/Arrow conversion and `mapInArrow` overhead;
+  `witchhat.spark`/`mapInArrow` has no CI coverage, only the manual `tools/spark_smoke.py`;
+  root `Cargo.toml`'s `panic = "abort"` release profile means an unexpected Rust panic
+  kills the whole Python worker instead of raising a catchable exception; wheels carry no
+  provenance (checksums, source commit SHA, SBOM, signing) linking them to the source they
+  were built from.
+
+Still open, pre-existing:
 
 - Broader `aggregate` type support: string min/max, `Decimal`/`Date`/`Time`/`Timestamp`
   aggregation are unbuilt (`Sum`/`Mean`/`Min`/`Max` are numeric-only today).
