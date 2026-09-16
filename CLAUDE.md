@@ -12,14 +12,16 @@ kernel including through `witchhat.spark`. Filter/project need no witchhat kerne
 Databricks Volumes verification were raised and explicitly closed as not pursued (see
 "Open items" below).
 
-A round of external code review on 2026-09-16 raised concrete correctness gaps in
-several of the "resolved and shipped" items below (dedup hash-collision risk,
+A round of external code review (Codex) on 2026-09-16 raised concrete correctness gaps
+in several of the "resolved and shipped" items below (dedup hash-collision risk,
 `broadcast_join` right/full semantics, join null-key semantics, aggregate `f64`
 precision, PyO3 GIL retention, plus several lower-priority items: partition-buffering
 memory, equivalence testing being probabilistic-only, Rust-vs-Spark regex dialect,
 unproven Spark-integration performance/CI coverage, `panic = "abort"` worker safety,
-artifact provenance). These are real, not yet fixed; treat "resolved and shipped" below
-as "implemented", not "reviewed for correctness against Spark's semantics".
+artifact provenance). The five highest-priority items (everything except the
+lower-priority list) were fixed the same day; see "Resolved and shipped" below for what
+changed and "Still open" for the lower-priority items, which were raised but not acted
+on yet.
 
 ## Goals / constraints (from the user, verbatim intent)
 
@@ -65,9 +67,9 @@ crates/witchhat-core/src/validate.rs   ValidateSchemaOptions, SchemaDiff, valida
 crates/witchhat-core/src/json.rs       NormalizeVersion, NormalizeStats, normalize_json
 crates/witchhat-core/src/clean.rs      CleanRule, CleanupVersion, apply_rules, preset, clean_with_preset
 crates/witchhat-core/src/equivalence.rs EquivalenceOptions, EquivalenceReport, check_equivalence
-crates/witchhat-core/src/dedup.rs      drop_duplicates (built on hash_batch)
-crates/witchhat-core/src/join.rs       JoinType, join (built on arrow_row, not hash_batch)
-crates/witchhat-core/src/aggregate.rs  AggFunc, Aggregation, aggregate (built on arrow_row too)
+crates/witchhat-core/src/dedup.rs      drop_duplicates (hash_batch buckets, arrow_row confirms)
+crates/witchhat-core/src/join.rs       JoinType, join, join_null_safe (built on arrow_row, not hash_batch)
+crates/witchhat-core/src/aggregate.rs  AggFunc, Aggregation, aggregate (arrow_row grouping, exact per-type numeric accumulation)
 crates/witchhat-core/src/cpu.rs        CpuFeatures, features()
 crates/witchhat-core/src/error.rs      Error, Result
 crates/witchhat-py/src/lib.rs          crate docs + pyo3 module shell (_witchhat)
@@ -126,7 +128,8 @@ still holds.
 |---|---|
 | `arrow-array`, `arrow-schema` | The data model. `witchhat-core` depends on these only, no pyo3 |
 | `arrow-select` | `filter_record_batch`/`take`, underlying `drop_duplicates`, `join`, `aggregate` |
-| `arrow-row` | `RowConverter`, underlying `join`/`aggregate`'s exact key/group comparison |
+| `arrow-row` | `RowConverter`, underlying `join`/`aggregate`'s exact key/group comparison and `drop_duplicates`'s hash-collision fallback |
+| `arrow-buffer` | `i256`, `aggregate`'s `Decimal256` accumulator/comparator |
 | `arrow-data` | `ArrayData`, the untyped array arrow's pyarrow bridge actually converts (witchhat-py only) |
 | `arrow` (feature `pyarrow`) | Zero-copy `RecordBatch`/`ArrayData` <-> pyarrow conversion (witchhat-py only) |
 | `xxhash-rust` (feature `xxh3`) | Per-value hash function underlying `hash_batch` |
@@ -208,19 +211,22 @@ Resolved and shipped:
   `validate_schema` + `table_fingerprint` over a column order shared between both sides
   (so declared column order alone doesn't cause a false mismatch); `is_equivalent()` is
   deliberately stricter than `SchemaDiff::is_breaking()` (an extra column fails it).
-- Deduplication (`dedup.rs`): `drop_duplicates`, reusing `hash_batch` as the dedup key
-  plus `arrow_select::filter::filter_record_batch`. Filter/project were deliberately
-  *not* wrapped: Arrow's own kernels already do the job.
-- Join (`join.rs`): `join` (inner/left/right/full), keyed via `arrow_row::RowConverter`
-  rather than `hash_batch` (correctness, not just speed: see "Layout" above). Colliding
-  right-side column names get suffixed `_right`; every output field is nullable.
-  Right/left key columns require an exact Arrow type match, no implicit coercion.
+- Deduplication (`dedup.rs`): `drop_duplicates`, using `hash_batch` as a bucketing key
+  plus `arrow_row::RowConverter` to confirm exact equality within a bucket (see the
+  2026-09-16 correctness-fix bullet below for why: a bucket alone would let a hash
+  collision drop a valid row) plus `arrow_select::filter::filter_record_batch`.
+  Filter/project were deliberately *not* wrapped: Arrow's own kernels already do the job.
+- Join (`join.rs`): `join`/`join_null_safe` (inner/left/right/full), keyed via
+  `arrow_row::RowConverter` rather than `hash_batch` (correctness, not just speed: see
+  "Layout" above). Colliding right-side column names get suffixed `_right`; every output
+  field is nullable. Right/left key columns require an exact Arrow type match, no
+  implicit coercion. `join` excludes null keys (Spark semantics); `join_null_safe` is
+  the opt-in for null-matches-null (see the fix bullet below).
 - Aggregate (`aggregate.rs`): `aggregate` with `Count`/`Sum`/`Mean`/`Min`/`Max`, grouped
-  via the same `arrow_row` approach as `join`. `Min`/`Max` preserve the source column's
-  exact type (compare through `f64` to find the extreme row, then `take` its original
-  value); `Sum`/`Mean` accumulate through `f64` (documented precision caveat beyond
-  ±2^53). Empty `group_by` means whole-table aggregate; an empty batch in that case still
-  produces one row (`Count` 0, others null), not zero rows.
+  via the same `arrow_row` approach as `join`. Numeric accumulation/comparison is
+  type-specific (`i128`/`u128`/native decimal mantissa), not a universal `f64` downcast;
+  see the fix bullet below. Empty `group_by` means whole-table aggregate; an empty batch
+  in that case still produces one row (`Count` 0, others null), not zero rows.
 - Widened `hash_batch`/`dedup`/`check_equivalence` type coverage: added `Date32/64`,
   `Time32/64`, `Timestamp` (any unit/timezone), `Decimal128/256`. Parameterized types
   fold their parameters (unit, timezone, precision, scale) into the hash's type key, not
@@ -265,39 +271,46 @@ Resolved and shipped:
   around every kernel, so `witchhat.spark` inherits it transitively without its own
   instrumentation code. `tools/metrics_smoke.py` verifies event shape and the
   enable/disable toggle against the built wheel; wired into CI's wheel round-trip step.
+- Review-driven correctness fixes (2026-09-16, same day as the review), all five
+  highest-priority items:
+  - `drop_duplicates` (`dedup.rs`) no longer trusts a `hash_batch` collision as
+    equality: rows sharing a hash are bucketed, then confirmed with
+    `arrow_row::RowConverter`'s exact comparison (the same one `join`/`aggregate`
+    already used) before either is treated as a duplicate.
+  - `join` (`join.rs`) now excludes null keys from matching by default, the same as
+    Spark/SQL (`NULL = NULL` is never true); `join_null_safe` is the new, separately
+    named, explicit opt-in for null-matches-null. Both share one internal
+    implementation (`join_impl`) that applies or skips the exclusion.
+  - `aggregate.rs` was rewritten around an internal `Num` type: `Sum`/`Mean` accumulate
+    and `Min`/`Max` compare at each numeric column's own exact precision (`i128` for
+    signed integers, `u128` for unsigned, native mantissa width for `Decimal128`/
+    `Decimal256`, added as newly-supported input types), never through a universal
+    `f64` downcast. `Sum`'s output type now follows the source (`Int64`/`UInt64`/
+    `Float64`/the source's own decimal type) instead of always `Float64`; `Sum`'s
+    accumulator overflowing is a new `Error::Overflow`, a hard error, not silent
+    wraparound. `Mean`'s single final division for a non-decimal source still uses
+    `f64` (unavoidable: the result is generally fractional), but the summation feeding
+    it is exact. Needed a new `arrow-buffer` dependency for `i256` (`Decimal256`'s
+    mantissa type).
+  - `witchhat.spark.broadcast_join` (`spark.py`) now raises `ValueError` outright for
+    `how="right"`/`"full"` instead of only documenting the unsoundness: `small_table`
+    is broadcast independently to every partition, so an unmatched row under those two
+    modes would previously have surfaced once per partition, silently, instead of once
+    overall. Also required fixing `_aggregate_output_schema` in the same file, a
+    regression the aggregate rewrite caused: it still declared `DoubleType` for every
+    `"sum"`/`"mean"` output, which no longer matches an integer/decimal source's new
+    exact output type and broke real `mapInArrow` execution (`getDouble` called on an
+    `Int64` Arrow array) — caught by actually running `tools/spark_smoke.py`, not by
+    the Rust test suite, which is exactly the "Spark integration is not tested in CI"
+    gap the review separately flagged.
+  - PyO3 bindings (`witchhat-py/src/python.rs`) now release the GIL for every kernel
+    call via `Python::allow_threads` (confirmed correct for the pinned `pyo3 0.25.1`;
+    `Python::detach` is a 0.29+ rename, do not use it here). Safe because pyo3 has
+    already finished extracting every argument into an owned Rust value before a
+    function's body runs, so the kernel call itself never touches a Python object.
 
-Still open, correctness gaps raised by external review (2026-09-16), highest priority
-first, none fixed yet:
-
-- **`drop_duplicates` trusts a hash collision as equality** (`dedup.rs`): rows are
-  deduplicated by `hash_batch`'s `u64` fingerprint alone; a collision would silently drop
-  a distinct, valid row instead of only a true duplicate. Needs a fallback exact-equality
-  check (e.g. `arrow_row::RowConverter`, as `join`/`aggregate` already use) within a hash
-  bucket before treating two rows as the same.
-- **`broadcast_join`'s `"right"`/`"full"` are unsound** (`spark.py`): `small_table` is
-  broadcast independently to every partition, so an unmatched right-side row surfaces
-  once *per partition* instead of once overall. Currently only documented as a caveat in
-  the docstring, not prevented. Fix: either restrict `how` to `"inner"`/`"left"` (raise
-  for `"right"`/`"full"`), or build a separate, properly partition-coordinated algorithm.
-- **`join` null-key semantics probably differ from Spark** (`join.rs`): keys are matched
-  via `arrow_row::RowConverter`'s byte-exact row encoding with no explicit null handling,
-  which likely treats two null keys as equal; Spark/SQL semantics say `NULL` never equals
-  `NULL`. Fix: exclude null keys from matching in the default join mode, and add a
-  separate, explicitly opt-in null-safe join mode for callers who want null-equals-null.
-- **`aggregate` loses numeric precision through `f64`** (`aggregate.rs`): `Sum`/`Mean`
-  accumulate through `f64` (documented ±2^53 caveat) and `Min`/`Max` locate the extreme
-  row by comparing through `f64` too (`extract_f64`), so two distinct large integers could
-  compare equal before the original value is `take`n back out. User-specified fix: type
-  specific accumulation/comparison, not a universal `f64` downcast — `i128`/`u128` for
-  integers, `Decimal128`/`Decimal256` for decimals, `f64` only for actual floats, native
-  integer representation for date/time.
-- **PyO3 bindings never release the GIL** (`witchhat-py/src/python.rs`): every
-  `#[pyfunction]` calls its Rust kernel synchronously while holding the GIL, blocking
-  every other Python thread for the whole kernel call. Fix: extract the Arrow-owned
-  input, run the kernel inside `Python::allow_threads` (pyo3 0.25.1's name for this;
-  `Python::detach` is a 0.29+ rename, do not use it against this pinned version), and
-  reacquire the GIL only to construct the returned Python object.
-- Lower priority, same review round, not yet triaged into concrete fixes: whole Spark
+Still open, lower-priority items from the same review round, not yet triaged into
+concrete fixes: whole Spark
   partitions are buffered in memory (`drop_duplicates`/`aggregate` in `spark.py`, via
   `pa.concat_batches`) rather than streamed; `check_equivalence` is fingerprint-only
   (probabilistic), with no `exact` mode (schema + sorted/full row comparison); Rust's
@@ -311,8 +324,9 @@ first, none fixed yet:
 
 Still open, pre-existing:
 
-- Broader `aggregate` type support: string min/max, `Decimal`/`Date`/`Time`/`Timestamp`
-  aggregation are unbuilt (`Sum`/`Mean`/`Min`/`Max` are numeric-only today).
+- Broader `aggregate` type support: `Decimal128`/`Decimal256` are now supported
+  (2026-09-16 fix, see above); string min/max and `Date`/`Time`/`Timestamp` aggregation
+  are still unbuilt.
 - Deeper JSON normalization: array-valued fields and more than one level of object
   nesting are unbuilt (fall into the type-mismatch case in `normalize_json` today).
 - A distributed shuffle join through witchhat: `witchhat.spark.broadcast_join` only

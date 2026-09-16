@@ -43,7 +43,7 @@ pub use dedup::drop_duplicates;
 pub use equivalence::{EquivalenceOptions, EquivalenceReport, check_equivalence};
 pub use error::{Error, Result};
 pub use hash::{HashVersion, hash_batch, hash_batch_all_columns, table_fingerprint};
-pub use join::{JoinType, join};
+pub use join::{JoinType, join, join_null_safe};
 pub use json::{NormalizeStats, NormalizeVersion, normalize_json};
 pub use schema::{DataType, Field, Fields, Schema, SchemaRef, schema_fingerprint};
 pub use validate::{

@@ -4,7 +4,7 @@
 **Status** Describes the surface as built: composite hashing, schema validation, JSON normalization, regex cleanup, output-equivalence testing, deduplication, join, aggregate, schema/CPU introspection, the `witchhat.spark` Databricks/Spark integration layer, and optional JSON metric logging.
 **Audience** Anyone calling this library from Python or from Rust.
 **Companion documents** `architecture.md` for why the design is shaped this way, `operations.md` for building and deploying it.
-**Version** 1.5
+**Version** 1.6
 **Date** 2026-09-16
 
 ---
@@ -25,7 +25,7 @@
   - 8. `clean_with_preset` and `clean_with_rules`
   - 9. `check_equivalence` and `EquivalenceReport`
   - 10. `drop_duplicates`
-  - 11. `join`
+  - 11. `join`, `join_null_safe`
   - 12. `aggregate`
   - 13. `cpu_features` and `CpuFeatures`
 - III. Databricks/Spark Surface (`witchhat.spark`)
@@ -149,8 +149,8 @@ version ("v1")               -+
 
 | Exception | Raised when |
 |---|---|
-| `ValueError` | `version` does not name a known algorithm, a preset `name` is unrecognised, or a `how`/`func` string (`join`/`aggregate`) is unrecognised |
-| `RuntimeError` | A name in `columns` is not in `batch`'s schema, a column's Arrow type has no defined hash/kernel, or `join`'s key types mismatch |
+| `ValueError` | `version` does not name a known algorithm, a preset `name` is unrecognised, a `how`/`func` string (`join`/`join_null_safe`/`aggregate`) is unrecognised, or `wspark.broadcast_join` was called with `how="right"`/`"full"` |
+| `RuntimeError` | A name in `columns` is not in `batch`'s schema, a column's Arrow type has no defined hash/kernel, `join`/`join_null_safe`'s key types mismatch, or `aggregate`'s exact `"sum"`/`"mean"` accumulator overflows |
 
 `validate_schema` and `normalize_json` are the exceptions to the `RuntimeError` row: a
 schema mismatch and a malformed JSON row are both normal, representable results, not
@@ -279,12 +279,16 @@ witchhat.drop_duplicates(batch, columns, version="v1") -> pyarrow.RecordBatch
 
 Keeps the first row of every distinct value of `columns`, dropping the rest, preserving
 the relative order of the rows that remain. Equivalent to Spark's
-`df.dropDuplicates(subset=columns)`. Same exceptions as `hash_rows`.
+`df.dropDuplicates(subset=columns)`. A hash collision between two distinct rows never
+causes a false duplicate: rows sharing a hash are additionally compared exactly before
+either is treated as a duplicate (`architecture.md` Chapter VIII). Same exceptions as
+`hash_rows`.
 
-### 11. `join`
+### 11. `join`, `join_null_safe`
 
 ```python
 witchhat.join(left, right, left_keys, right_keys, how="inner") -> pyarrow.RecordBatch
+witchhat.join_null_safe(left, right, left_keys, right_keys, how="inner") -> pyarrow.RecordBatch
 ```
 
 Joins `left` and `right` on `left_keys`/`right_keys`, matched pairwise by position.
@@ -293,6 +297,12 @@ Joins `left` and `right` on `left_keys`/`right_keys`, matched pairwise by positi
 `_right`, and every field nullable (an outer join can null either side). See
 `architecture.md` Chapter IX for the full design, including why key comparison uses
 `arrow_row` rather than `hash_batch`.
+
+`join`'s null key semantics match Spark/SQL: a row with a null in any key column never
+matches, including another row that is also null there (`NULL = NULL` is never true).
+`join_null_safe` is the explicit opt-in for the opposite: a null key matches another null
+key, column by column (`architecture.md` Chapter IX, Section 4). Reach for `join` unless
+you have a specific, deliberate reason to want null-matches-null.
 
 Raises `ValueError` for an unrecognised `how`; `RuntimeError` for an unknown column, or
 `left_keys[i]`'s type not exactly matching `right_keys[i]`'s (see Section 7 below).
@@ -305,18 +315,23 @@ witchhat.aggregate(batch, group_by, aggregations) -> pyarrow.RecordBatch
 
 Groups `batch` by `group_by` and reduces each group with `aggregations`, a list of
 `(column, func, alias)` triples. `group_by` may be empty (whole-table aggregate). See
-`architecture.md` Chapter X for grouping semantics and why `Min`/`Max` preserve the
-source type while `Sum`/`Mean` accumulate through `f64`.
+`architecture.md` Chapter X for grouping semantics and how `Sum`/`Mean`/`Min`/`Max`
+accumulate and compare at each column's own exact numeric precision (`i128`/`u128`/
+decimal mantissa), never through a universal `float64` downcast.
 
 <Table 2-7> Aggregate functions accepted by `aggregate`
 
 | `func` | Input types | Output | Null handling |
 |---|---|---|---|
 | `"count"` | any | `int64` | Counts non-null values |
-| `"sum"` | numeric | `float64` | `None` if the group is all-null |
-| `"mean"` / `"avg"` | numeric | `float64` | `None` if the group is all-null |
-| `"min"` | numeric | matches input | `None` if the group is all-null |
-| `"max"` | numeric | matches input | `None` if the group is all-null |
+| `"sum"` | numeric, `decimal128`/`decimal256` | `int64` (signed source), `uint64` (unsigned source), `float64` (float source), or the source's own decimal type | `None` if the group is all-null |
+| `"mean"` / `"avg"` | numeric, `decimal128`/`decimal256` | `float64` (integer/float source) or the source's own decimal type | `None` if the group is all-null |
+| `"min"` | numeric, `decimal128`/`decimal256` | matches input | `None` if the group is all-null |
+| `"max"` | numeric, `decimal128`/`decimal256` | matches input | `None` if the group is all-null |
+
+`"sum"`/`"mean"` raise `RuntimeError` if the exact accumulator cannot represent a group's
+running total (an `Overflow` error on the Rust side), rather than silently losing
+precision the way a `float64` accumulator would.
 
 "numeric" here is `int8`..`int64`, `uint8`..`uint64`, `float32`, `float64` (see
 Section 8 below). Raises `ValueError` for an unrecognised `func`; `RuntimeError` for an
@@ -432,6 +447,11 @@ partition's batch against it with `witchhat.join`, mirroring Spark's own broadca
 optimization. Not a distributed shuffle join: use `DataFrame.join` directly for two
 large sides.
 
+`how` accepts only `"inner"`/`"left"`; `"right"`/`"full"` raise `ValueError` outright,
+not merely a documented caveat, because `small_table` is broadcast independently to every
+partition, so an unmatched `small_table` row under those two modes would surface once per
+partition instead of once overall (`architecture.md` Chapter XVI, Section 5).
+
 ### 8. `validate_schema`, `schema_fingerprint`
 
 ```python
@@ -511,6 +531,7 @@ witchhat_core::clean_with_preset(input: &StringArray, name: &str, version: Clean
 witchhat_core::check_equivalence(actual: &RecordBatch, expected: &RecordBatch, options: EquivalenceOptions) -> Result<EquivalenceReport>
 witchhat_core::drop_duplicates(batch: &RecordBatch, columns: &[&str], version: HashVersion) -> Result<RecordBatch>
 witchhat_core::join(left: &RecordBatch, right: &RecordBatch, left_keys: &[&str], right_keys: &[&str], how: JoinType) -> Result<RecordBatch>
+witchhat_core::join_null_safe(left: &RecordBatch, right: &RecordBatch, left_keys: &[&str], right_keys: &[&str], how: JoinType) -> Result<RecordBatch>
 witchhat_core::aggregate(batch: &RecordBatch, group_by: &[&str], aggregations: &[Aggregation]) -> Result<RecordBatch>
 witchhat_core::features() -> CpuFeatures
 ```
@@ -548,7 +569,7 @@ key matching use `arrow_row`, not `hash_batch` (`architecture.md` Chapter IX, Se
 | `witchhat_core::clean` | `CleanRule`, `CleanupVersion`, `apply_rules`, `preset`, `clean_with_preset` |
 | `witchhat_core::equivalence` | `EquivalenceOptions`, `EquivalenceReport`, `check_equivalence` |
 | `witchhat_core::dedup` | `drop_duplicates` |
-| `witchhat_core::join` | `JoinType`, `join` |
+| `witchhat_core::join` | `JoinType`, `join`, `join_null_safe` |
 | `witchhat_core::aggregate` | `AggFunc`, `Aggregation`, `aggregate` |
 | `witchhat_core::cpu` | `CpuFeatures`, `features` |
 | `witchhat_core::error` | `Error`, `Result` |
@@ -556,11 +577,13 @@ key matching use `arrow_row`, not `hash_batch` (`architecture.md` Chapter IX, Se
 ### 4. Error type
 
 `witchhat_core::Error` (`thiserror`-derived, `Clone`, `'static`): `UnknownColumn`,
-`TypeMismatch`, `SchemaMismatch`, `UnsupportedType`, `Config`. See `architecture.md`
-Chapter XIII. `validate_schema` does not return `Result`: an unequal schema is a normal
-result, not an `Error`. `normalize_json` returns `Result` only for a structural problem
-(an unsupported target type in `schema`), never for a malformed row, which is counted in
-`NormalizeStats` instead.
+`TypeMismatch`, `SchemaMismatch`, `UnsupportedType`, `Config`, `Overflow`. See
+`architecture.md` Chapter XIII. `validate_schema` does not return `Result`: an unequal
+schema is a normal result, not an `Error`. `normalize_json` returns `Result` only for a
+structural problem (an unsupported target type in `schema`), never for a malformed row,
+which is counted in `NormalizeStats` instead. `Overflow` is returned only by
+`aggregate`'s `"sum"`/`"mean"`, when the exact accumulator cannot represent a group's
+running total (`architecture.md` Chapter X, Section 3).
 
 ## VI. Semantics Callers Must Know
 
@@ -623,11 +646,13 @@ should be treated as comparable.
 ### 8. `aggregate` is numeric-only beyond `Count`
 
 `"sum"`/`"mean"`/`"min"`/`"max"` only accept `int8`..`int64`, `uint8`..`uint64`,
-`float32`, `float64` columns; a `Decimal`/`Date`/`Time`/`Timestamp`/`Utf8` column raises
-`RuntimeError` for any of those four (`"count"` accepts any column type). `"sum"`/
-`"mean"` accumulate through `f64`, so an `int64`/`uint64` column with values beyond
-`f64`'s exact-integer range (±2^53) can lose precision in the result; `"min"`/`"max"`
-are unaffected, since they return the original, untouched value from the source column.
+`float32`, `float64`, `decimal128`, `decimal256` columns; a `Date`/`Time`/`Timestamp`/
+`Utf8` column raises `RuntimeError` for any of those four (`"count"` accepts any column
+type). All four accumulate/compare at the source column's own exact precision
+(`i128`/`u128`/decimal mantissa), not through `f64`, so an `int64`/`uint64` value or sum
+beyond `f64`'s exact-integer range (±2^53) stays exact; `"sum"`/`"mean"` raise
+`RuntimeError` (an `Overflow` error on the Rust side) if the exact accumulator itself
+cannot represent the running total, rather than silently losing precision.
 
 ### 9. `witchhat.spark`'s `repartition=True` default
 

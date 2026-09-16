@@ -1,16 +1,23 @@
 //! Deduplication: the first native transformation, replacing Spark's
 //! `dropDuplicates`.
 //!
-//! Built directly on [`crate::hash`] rather than a second row-comparison algorithm: a
-//! row's composite hash over the given columns already is a dedup key, so
-//! deduplication is "keep the first row whose hash has not been seen yet", one pass,
-//! one extra `HashSet`. Filter and project, the other basic relational operations, are
-//! not wrapped here because [`arrow_select`] already provides them
+//! Uses [`crate::hash`] as a bucketing key, not as the final answer: a row's composite
+//! hash over the given columns groups candidate duplicates cheaply, but a `u64`
+//! fingerprint collision between two genuinely different rows is possible, and treating
+//! it as equality would silently drop a distinct, valid row. So within a hash bucket,
+//! [`arrow_row::RowConverter`] (the same exact, byte-comparable row format
+//! [`mod@crate::join`]/[`mod@crate::aggregate`] use) confirms true equality before a row is
+//! treated as a duplicate; the hash only decides which small bucket to compare against,
+//! never decides equality itself. Filter and project, the other basic relational
+//! operations, are not wrapped here because [`arrow_select`] already provides them
 //! (`arrow_select::filter::filter_record_batch`, `RecordBatch::project`) with no
 //! witchhat-specific behaviour to add; this module exists for the one operation that
 //! actually needs witchhat's own hashing.
 
+use std::collections::HashMap;
+
 use arrow_array::RecordBatch;
+use arrow_row::{RowConverter, SortField};
 use arrow_select::filter::filter_record_batch;
 
 use crate::error::{Error, Result};
@@ -27,10 +34,11 @@ use crate::hash::{HashVersion, hash_batch};
 /// values are equal under those rules count as duplicates, including when both are
 /// null in every listed column.
 ///
-/// Hash collisions are not distinguished from true duplicates (the `u64` fingerprint
-/// space is large enough that this is not a practical concern for realistic batch
-/// sizes, but it is not a proof of distinctness either); see
-/// `docs/architecture.md` Chapter XI for the same caveat as `table_fingerprint`.
+/// A `u64` fingerprint collision between two distinct rows never causes a false
+/// duplicate: rows sharing a hash are additionally compared with
+/// [`arrow_row::RowConverter`]'s exact, byte-comparable row format before either is
+/// treated as a duplicate of the other, so the hash only narrows which rows get
+/// compared, and never substitutes for the comparison itself.
 ///
 /// # Errors
 ///
@@ -39,9 +47,10 @@ use crate::hash::{HashVersion, hash_batch};
 ///
 /// # Panics
 ///
-/// Does not panic. Not async; runs on the calling thread in time linear in
-/// `batch.num_rows() * columns.len()`, with one `HashSet<u64>` sized to at most
-/// `batch.num_rows()` entries and no I/O.
+/// Does not panic. Not async; runs on the calling thread with no I/O. Hashing is linear
+/// in `batch.num_rows() * columns.len()`; the exactness check is linear overall unless
+/// an adversarial or pathological input produces many rows sharing one hash bucket, in
+/// which case that bucket's own rows are compared pairwise against each newcomer.
 ///
 /// # Examples
 ///
@@ -64,8 +73,41 @@ pub fn drop_duplicates(
 ) -> Result<RecordBatch> {
     let hashes = hash_batch(batch, columns, version)?;
 
-    let mut seen = std::collections::HashSet::with_capacity(batch.num_rows());
-    let keep: Vec<bool> = hashes.values().iter().map(|&h| seen.insert(h)).collect();
+    let key_columns: Vec<arrow_array::ArrayRef> = columns
+        .iter()
+        .map(|name| {
+            batch
+                .schema()
+                .index_of(name)
+                .map(|idx| std::sync::Arc::clone(batch.column(idx)))
+                .map_err(|_| Error::unknown_column(*name))
+        })
+        .collect::<Result<_>>()?;
+    let fields: Vec<SortField> = key_columns
+        .iter()
+        .map(|c| SortField::new(c.data_type().clone()))
+        .collect();
+    let converter = RowConverter::new(fields).map_err(|e| Error::config(e.to_string()))?;
+    let rows = converter
+        .convert_columns(&key_columns)
+        .map_err(|e| Error::config(e.to_string()))?;
+
+    let mut buckets: HashMap<u64, Vec<arrow_row::OwnedRow>> = HashMap::new();
+    let keep: Vec<bool> = hashes
+        .values()
+        .iter()
+        .enumerate()
+        .map(|(i, &h)| {
+            let row = rows.row(i).owned();
+            let bucket = buckets.entry(h).or_default();
+            if bucket.contains(&row) {
+                false
+            } else {
+                bucket.push(row);
+                true
+            }
+        })
+        .collect();
 
     filter_record_batch(batch, &arrow_array::BooleanArray::from(keep))
         .map_err(|e| Error::schema_mismatch(e.to_string()))

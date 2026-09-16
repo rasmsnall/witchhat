@@ -138,6 +138,12 @@ def main() -> int:
     full = witchhat.join(users, orders, ["id"], ["user_id"], how="full")
     assert full.num_rows == 5  # + the unmatched "ghost" order
 
+    # null keys never match by default (Spark semantics), but do under join_null_safe
+    null_left = pa.record_batch({"k": pa.array([None, 1], type=pa.int64())})
+    null_right = pa.record_batch({"k": pa.array([None], type=pa.int64())})
+    assert witchhat.join(null_left, null_right, ["k"], ["k"], how="inner").num_rows == 0
+    assert witchhat.join_null_safe(null_left, null_right, ["k"], ["k"], how="inner").num_rows == 1
+
     sales = pa.record_batch(
         {
             "country": pa.array(["NO", "SE", "NO"]),
@@ -146,8 +152,26 @@ def main() -> int:
     )
     totals = witchhat.aggregate(sales, ["country"], [("amount", "sum", "total")])
     assert totals.num_rows == 2
+    # Sum of a signed integer column stays Int64 (exact), not Float64.
+    assert totals.schema.field("total").type == pa.int64(), totals.schema
     by_country = dict(zip(totals.column("country").to_pylist(), totals.column("total").to_pylist()))
-    assert by_country["NO"] == 15.0
+    assert by_country["NO"] == 15
+
+    # a value beyond f64's exact-integer range (2**53) stays exact through Sum/Min/Max
+    big = 2**53 + 1
+    big_batch = pa.record_batch(
+        {
+            "g": pa.array(["x", "x"]),
+            "amount": pa.array([big, 1], type=pa.int64()),
+        }
+    )
+    big_totals = witchhat.aggregate(
+        big_batch,
+        ["g"],
+        [("amount", "sum", "total"), ("amount", "max", "hi")],
+    )
+    assert big_totals.column("total").to_pylist()[0] == big + 1
+    assert big_totals.column("hi").to_pylist()[0] == big
 
     print("OK")
     return 0

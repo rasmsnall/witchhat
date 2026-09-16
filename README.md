@@ -164,21 +164,30 @@ isn't versioned by witchhat at all. See
 column fails equivalence even though it wouldn't fail schema validation. See
 [`crates/witchhat-core/src/equivalence.rs`](crates/witchhat-core/src/equivalence.rs).
 
-**Deduplication builds on hashing instead of reinventing row comparison.**
-[`drop_duplicates`] is a native transformation equivalent to Spark's
-`dropDuplicates`: one pass with `hash_batch` as the dedup key.
-Filter and project were left to Arrow's own compute kernels, which already
-do the job with nothing witchhat-specific to add. See
+**Deduplication uses hashing to bucket, not to decide.** [`drop_duplicates`] is
+a native transformation equivalent to Spark's `dropDuplicates`: `hash_batch`'s
+composite hash groups candidate duplicates cheaply, but a `u64` collision
+between two distinct rows never causes a false duplicate, since rows sharing
+a hash are additionally compared with `arrow_row::RowConverter`'s exact,
+byte-comparable format before either is treated as a duplicate. Filter and
+project were left to Arrow's own compute kernels, which already do the job
+with nothing witchhat-specific to add. See
 [`crates/witchhat-core/src/dedup.rs`](crates/witchhat-core/src/dedup.rs).
 
-**Join and aggregate use exact comparison, not a fingerprint.** A join or a
-group-by boundary is a correctness question, not a "probably the same"
-one, so [`join`] and [`aggregate`] key rows through
+**Join and aggregate use exact comparison, not a fingerprint, and exact
+numeric precision, not `f64`.** A join or a group-by boundary is a
+correctness question, not a "probably the same" one, so [`join`] and
+[`aggregate`] key rows through
 [`arrow_row::RowConverter`](https://docs.rs/arrow-row) instead of
 `hash_batch`: two rows compare equal only when they truly are, not when
-their `u64` fingerprints happen to collide. [`aggregate`]'s `Min`/`Max`
-additionally preserve the source column's exact type rather than losing it
-to the `f64` comparison used only to find the extreme value. See
+their `u64` fingerprints happen to collide. [`join`] excludes null keys from
+matching by default, the same as Spark/SQL (`NULL = NULL` is never true);
+[`join_null_safe`] is the explicit opt-in for the opposite.
+[`aggregate`]'s `Sum`/`Mean`/`Min`/`Max` accumulate and compare at each
+numeric column's own exact precision (`i128`/`u128`/native `Decimal128`/
+`Decimal256` mantissa) instead of a universal `f64` downcast, so an integer
+value or sum beyond `f64`'s exact range (±2^53) stays exact and two distinct
+large integers never compare equal by accident. See
 [`crates/witchhat-core/src/join.rs`](crates/witchhat-core/src/join.rs) and
 [`crates/witchhat-core/src/aggregate.rs`](crates/witchhat-core/src/aggregate.rs).
 
@@ -190,7 +199,10 @@ partition at a time with no visibility across partitions, so that default is
 what makes the result correct for the whole DataFrame, not merely a
 convenience. `broadcast_join` mirrors Spark's own broadcast-join
 optimization rather than attempting a distributed shuffle join, which
-witchhat (not a distributed engine) cannot do; see
+witchhat (not a distributed engine) cannot do, and rejects
+`how="right"`/`"full"` outright (`ValueError`): broadcasting the small side
+independently to every partition makes those two modes structurally unsound,
+not just discouraged. See
 [`crates/witchhat-py/python/witchhat/spark.py`](crates/witchhat-py/python/witchhat/spark.py).
 
 ## Not built yet
@@ -203,8 +215,9 @@ logging (`witchhat.metrics`) are done. What's left:
 1. **Reproducible-build check.** manylinux abi3 wheels build + CI for both
    `x86_64` and `aarch64` (Graviton) (see `.github/workflows/ci.yml`); still
    need a same-inputs -> byte-identical-wheel check.
-2. **Broader `aggregate` type support.** `Sum`/`Mean`/`Min`/`Max` are numeric-only
-   today (no string min/max, no `Decimal`/`Date`/`Time`/`Timestamp` aggregation).
+2. **Broader `aggregate` type support.** `Sum`/`Mean`/`Min`/`Max` now cover
+   `Decimal128`/`Decimal256` alongside the numeric types (2026-09-16); string
+   min/max and `Date`/`Time`/`Timestamp` aggregation are still unbuilt.
 3. **Deeper JSON normalization.** `normalize_json` supports one level of
    nested-object flattening; array-valued fields and deeper nesting are not
    yet handled.
@@ -224,16 +237,23 @@ Section 2 for the reasoning.
 Type hints and generated docs (`.pyi` stubs, `py.typed`, `docs/*.md` + generated
 `.docx`) are done; see the Documentation section above.
 
-## Known correctness gaps
+## Correctness fixes from external review
 
-An external code review (2026-09-16) found real correctness issues in code that was
-already implemented and only documented as a caveat, not fixed: `drop_duplicates` treats
-a hash collision as row equality; `witchhat.spark.broadcast_join`'s `"right"`/`"full"`
-modes are unsound under per-partition broadcast; `join` likely treats two null keys as
-matching, unlike Spark; `aggregate` accumulates `Sum`/`Mean` and compares `Min`/`Max`
-through `f64`, losing precision beyond ±2^53; PyO3 bindings never release the GIL during
-kernel execution. None of these are fixed yet. See `CLAUDE.md`'s "Open items" for the
-full list, including lower-priority findings from the same review.
+An external (Codex) code review on 2026-09-16 found real correctness issues in code that
+was already implemented and, until then, only documented as a caveat rather than fixed.
+All five highest-priority findings were fixed the same day: `drop_duplicates` no longer
+treats a hash collision as row equality (falls back to an exact `arrow_row` comparison
+within a hash bucket); `join` excludes null keys from matching by default, the same as
+Spark, with the new `join_null_safe` as an explicit opt-in for null-matches-null;
+`aggregate`'s `Sum`/`Mean`/`Min`/`Max` accumulate and compare at each numeric column's
+own exact precision (`i128`/`u128`/native decimal mantissa, plus new `Decimal128`/
+`Decimal256` support) instead of downcasting through `f64`; `witchhat.spark.broadcast_join`
+now rejects `how="right"`/`"full"` outright instead of merely documenting why they were
+unsound; and every PyO3-bound kernel call now releases the GIL for its duration. See
+`CLAUDE.md`'s "Open items" for exactly what changed in each case, plus the lower-priority
+findings from the same review that are not yet acted on (partition memory buffering,
+`check_equivalence` exactness, Rust-vs-Spark regex dialect, unproven Spark performance
+claims, no Spark integration CI, `panic = "abort"` worker safety, artifact provenance).
 
 ## Tests
 
@@ -241,7 +261,7 @@ full list, including lower-priority findings from the same review.
 cargo test --workspace
 ```
 
-68 unit tests plus 14 doctests, all in `witchhat-core`, covering: hash determinism,
+76 unit tests plus 15 doctests, all in `witchhat-core`, covering: hash determinism,
 column-order sensitivity, null-vs-value distinctness, type-tag collision avoidance
 (including the Date/Time/Timestamp/Decimal types added alongside join/aggregate), float
 canonicalization; schema-diff correctness (missing/unexpected/retyped/nullability,
@@ -250,9 +270,11 @@ vs. explicit-null, nested-path extraction); regex cleanup (every built-in preset
 ordering, invalid-pattern rejection); output equivalence (identical, reordered,
 different-value, different-row-count, column-order-independent, explicit-column-subset
 batches); deduplication (first-occurrence order, composite keys, unknown columns); join
-(inner/left/right/full, composite keys, name-collision suffixing, key-type mismatch);
-and aggregate (sum/count/min/max per group, type preservation, whole-table and
-empty-batch aggregation, unsupported-type rejection).
+(inner/left/right/full, composite keys, name-collision suffixing, key-type mismatch,
+null-key exclusion versus `join_null_safe`); and aggregate (sum/count/min/max per group,
+exact numeric precision beyond `f64`'s ±2^53 range, `Decimal128` type preservation,
+sum-overflow rejection, whole-table and empty-batch aggregation, unsupported-type
+rejection).
 `cargo doc --no-deps -p witchhat-core` and `cargo clippy --workspace --all-targets`
 both run clean with warnings denied (`missing_docs`, `broken_intra_doc_links`, clippy's
 default lint set); see `.github/workflows/ci.yml`.

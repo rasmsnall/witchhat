@@ -437,6 +437,11 @@ def join(
     """Join ``left`` and ``right`` on ``left_keys``/``right_keys``, matched pairwise
     by position (``left_keys[0]`` compares against ``right_keys[0]``, and so on).
 
+    A row whose key has a null in any of ``left_keys``/``right_keys`` never matches
+    another row, the same as Spark/SQL (``NULL = NULL`` is never true); use
+    :func:`join_null_safe` for the opposite. Such a row still appears as unmatched
+    wherever ``how`` keeps unmatched rows.
+
     The output schema is every field of ``left`` followed by every field of
     ``right``; a ``right`` field whose name collides with a ``left`` field is
     suffixed ``_right``. Every output field is nullable regardless of the input
@@ -473,6 +478,28 @@ def join(
         ``left_keys[i]``'s type does not exactly match ``right_keys[i]``'s.
     """
 
+def join_null_safe(
+    left: _ArrowArrayExportable,
+    right: _ArrowArrayExportable,
+    left_keys: list[str],
+    right_keys: list[str],
+    how: str = "inner",
+) -> "pa.RecordBatch":
+    """Same as :func:`join`, except a null key matches another null key instead of
+    never matching anything.
+
+    Spark's own ``DataFrame.join`` never does this, so reach for :func:`join` by
+    default; this exists only for a caller with a specific, deliberate reason to
+    want it. Matching is a plain per-column comparison with no null exclusion: a
+    null in one key column matches a null in the same key column on the other
+    side, and every other, non-null key column still needs an exact match, so a
+    partial-null composite key is not a wildcard, only that one column's null is.
+
+    Raises
+    ------
+    Same as :func:`join`.
+    """
+
 def aggregate(
     batch: _ArrowArrayExportable,
     group_by: list[str],
@@ -497,10 +524,17 @@ def aggregate(
         Column names to group by.
     aggregations:
         ``(column, func, alias)`` triples. ``func`` is ``"count"`` (non-null values,
-        any column type, output ``int64``), ``"sum"``/``"mean"`` (numeric columns
-        only, output ``float64``, ``None`` if every value in the group is null), or
-        ``"min"``/``"max"`` (numeric columns only, output type matches the input
-        column, ``None`` if every value in the group is null).
+        any column type, output ``int64``); ``"sum"`` (numeric columns only,
+        summed at the input's own exact precision, ``None`` if every value in the
+        group is null; output ``int64`` for a signed integer source, ``uint64`` for
+        an unsigned source, ``float64`` for a float source, or the source's own
+        ``decimal128``/``decimal256`` type for a decimal source); ``"mean"`` (same
+        exact summation as ``"sum"``, only the final division is not exact; output
+        ``float64`` for an integer or float source, or the source's own decimal
+        type, mantissa integer-divided by the count and truncated, for a decimal
+        source); or ``"min"``/``"max"`` (numeric columns only, compared at the
+        input's own exact precision, never through ``float64``; output type
+        matches the input column, ``None`` if every value in the group is null).
 
     Returns
     -------
@@ -513,7 +547,11 @@ def aggregate(
     RuntimeError
         A name in ``group_by`` or an aggregation's ``column`` is not in ``batch``'s
         schema, or a ``sum``/``mean``/``min``/``max`` column is not numeric
-        (``int8``..``int64``, ``uint8``..``uint64``, ``float32``, ``float64``).
+        (``int8``..``int64``, ``uint8``..``uint64``, ``float32``, ``float64``,
+        ``decimal128``, ``decimal256``). Also raised (as ``RuntimeError``) if
+        ``sum``/``mean``'s exact accumulator cannot represent a group's running
+        total; this replaces silent, wrong output from the previous ``float64``
+        accumulator overflowing its precision unnoticed.
     """
 
 def cpu_features() -> CpuFeatures:

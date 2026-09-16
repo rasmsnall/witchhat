@@ -4,7 +4,7 @@
 **Status** Partial by necessity: witchhat is a stateless transformation library today, with no write path, no job to schedule, and no storage of its own. This document covers what already applies (build, install, sizing) and defers what does not yet (Chapter VI).
 **Audience** Whoever builds the wheel and installs it on a Databricks workspace.
 **Companion documents** `architecture.md` for the design, `api.md` for the callable surface.
-**Version** 1.6
+**Version** 1.7
 **Date** 2026-09-16
 
 ---
@@ -188,8 +188,12 @@ beyond what Arrow's own reference-counted buffers already share with the caller.
 Every kernel runs on the calling thread; nothing here uses multiple cores yet. On a
 Databricks driver or worker, parallelism today comes from calling witchhat once per Spark
 partition (e.g. from a `mapInArrow`/Pandas UDF), not from anything internal to the
-library. A future kernel expensive enough to justify releasing the GIL (`architecture.md`
-Chapter XII) would also be a candidate for internal parallelism; neither exists yet.
+library. Every PyO3-bound kernel call does release the GIL for its duration
+(`architecture.md` Chapter XII), so multiple Python threads calling witchhat
+concurrently (a Spark executor running several `mapInArrow` tasks, for instance) do not
+block each other on it; that is a concurrency improvement for the Python process as a
+whole, not internal multi-core parallelism within one kernel call, which still does not
+exist.
 
 ### 4. Schema validation is a different shape
 

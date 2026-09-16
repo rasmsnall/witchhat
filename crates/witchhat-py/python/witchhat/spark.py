@@ -262,14 +262,39 @@ def drop_duplicates(
 
 
 def _aggregate_output_schema(df: "DataFrame", group_by: list[str], aggregations: list[tuple[str, str, str]]) -> "StructType":
-    from pyspark.sql.types import DoubleType, LongType, StructField, StructType
+    from pyspark.sql.types import (
+        ByteType,
+        DecimalType,
+        DoubleType,
+        IntegerType,
+        LongType,
+        ShortType,
+        StructField,
+        StructType,
+    )
 
     fields = [StructField(name, df.schema[name].dataType, nullable=True) for name in group_by]
     for column, func, alias in aggregations:
         if func == "count":
             fields.append(StructField(alias, LongType(), nullable=False))
         elif func in ("sum", "mean", "avg"):
-            fields.append(StructField(alias, DoubleType(), nullable=True))
+            source_type = df.schema[column].dataType
+            # Must track witchhat_core::aggregate's type-specific output exactly, or
+            # mapInArrow's declared schema lies about what the Arrow batch actually
+            # holds (a signed integer source now stays exact and comes back as an
+            # int64 array for "sum", not a float64 one): a decimal source keeps its
+            # own precision/scale; a signed integer source is exact for "sum" (int64)
+            # but "mean"/"avg" still ends in one float division regardless of source
+            # type, same as a float source's "sum".
+            if isinstance(source_type, DecimalType):
+                out_type = source_type
+            elif func == "sum" and isinstance(
+                source_type, (ByteType, ShortType, IntegerType, LongType)
+            ):
+                out_type = LongType()
+            else:
+                out_type = DoubleType()
+            fields.append(StructField(alias, out_type, nullable=True))
         elif func in ("min", "max"):
             fields.append(StructField(alias, df.schema[column].dataType, nullable=True))
         else:
@@ -391,18 +416,30 @@ def broadcast_join(
     left_keys, right_keys:
         Column names, matched pairwise; see `witchhat.join`.
     how:
-        `"inner"`, `"left"`, `"right"` or `"full"`; see `witchhat.join`. `"right"`/
-        `"full"` also surface `small_table` rows unmatched in a given partition,
-        which is very likely not what you want when `small_table` is broadcast to
-        *every* partition (an unmatched small-table row would appear once per
-        partition, not once overall) — prefer `"inner"`/`"left"` unless you have
-        specifically accounted for that.
+        `"inner"` or `"left"` only; see `witchhat.join`. `"right"`/`"full"` are
+        rejected outright (`ValueError`), not just discouraged: `small_table` is
+        broadcast independently to *every* partition, so under those two modes an
+        unmatched `small_table` row would be produced once per partition instead of
+        once overall, silently multiplying it into wrong output with no error and
+        no warning. A large-large join with genuine `"right"`/`"full"` semantics
+        needs partition coordination this broadcast pattern cannot give it; use
+        Spark's own `DataFrame.join` for that instead.
 
     Raises
     ------
+    ValueError
+        `how` is `"right"` or `"full"`.
     ImportError
         pyspark is not installed.
     """
+    if how in ("right", "full"):
+        raise ValueError(
+            f"broadcast_join does not support how={how!r}: small_table is broadcast "
+            "independently to every partition, so an unmatched small_table row would "
+            "surface once per partition instead of once overall, which is silently "
+            "wrong, not just surprising. Use how='inner' or how='left', or route a "
+            "genuine right/full join through Spark's own DataFrame.join instead."
+        )
     _require_pyspark()
     bc = df.sparkSession.sparkContext.broadcast(small_table)
     out_schema = _broadcast_join_output_schema(df.schema, small_table.schema)

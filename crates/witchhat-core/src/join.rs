@@ -9,11 +9,17 @@
 //! support every Arrow type `RowConverter` does, a broader range than [`crate::hash`]'s
 //! own hand-rolled type dispatch (`docs/architecture.md` Chapter VIII, Section 2 has
 //! the fuller rationale for why the two kernels made different choices here).
+//!
+//! [`join`] excludes null keys from matching, the same as Spark/SQL (`NULL = NULL` is
+//! never true); [`join_null_safe`] is the explicit opt-in for the opposite behaviour.
+//! `RowConverter`'s raw byte comparison alone does not do this (two nulls encode to the
+//! same byte pattern and would otherwise match), so both entry points share one internal
+//! implementation that applies or skips the null exclusion.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, RecordBatch, UInt32Array};
+use arrow_array::{Array, ArrayRef, RecordBatch, UInt32Array};
 use arrow_row::{RowConverter, Rows, SortField};
 use arrow_schema::{Field, Schema};
 use arrow_select::take::take;
@@ -61,16 +67,40 @@ fn resolve_columns(batch: &RecordBatch, names: &[&str]) -> Result<Vec<ArrayRef>>
         .collect()
 }
 
-fn row_index(rows: &Rows) -> HashMap<arrow_row::OwnedRow, Vec<u32>> {
+fn row_index(rows: &Rows, skip: &[bool]) -> HashMap<arrow_row::OwnedRow, Vec<u32>> {
     let mut map: HashMap<arrow_row::OwnedRow, Vec<u32>> = HashMap::new();
     for (i, row) in rows.iter().enumerate() {
+        if skip[i] {
+            continue;
+        }
         map.entry(row.owned()).or_default().push(i as u32);
     }
     map
 }
 
+/// True at row `i` if any of `columns` is null there. Composite-key null exclusion (see
+/// [`join`]'s docs) means "any key column null", matching how a multi-column SQL/Spark
+/// equi-join condition (`a.x = b.x AND a.y = b.y`) is null, and therefore never true, the
+/// moment any operand is null.
+fn any_null(columns: &[ArrayRef], i: usize) -> bool {
+    columns.iter().any(|c| c.is_null(i))
+}
+
+fn null_mask(columns: &[ArrayRef], num_rows: usize) -> Vec<bool> {
+    (0..num_rows).map(|i| any_null(columns, i)).collect()
+}
+
 /// Joins `left` and `right` on `left_keys`/`right_keys`, matched pairwise by position
 /// (`left_keys[0]` compares against `right_keys[0]`, and so on).
+///
+/// Null key semantics match Spark/SQL: a row whose key has a null in any of `left_keys`
+/// (or `right_keys`) never matches another row, not even one that is also all-null in
+/// the same columns, because an equi-join condition (`a.x = b.x`) is null, not true,
+/// the moment either side is null, and `AND`ing more such conditions for a composite key
+/// cannot make the result true either. Such a row still appears in the output as
+/// unmatched wherever `how` keeps unmatched rows (e.g. every `left` row survives under
+/// [`JoinType::Left`]/[`JoinType::Full`], null key or not). Use [`join_null_safe`] for
+/// the opposite behaviour, where a null key matches another null key.
 ///
 /// The output schema is every field of `left` followed by every field of `right`; a
 /// `right` field whose name collides with a `left` field is suffixed `_right`. Every
@@ -134,6 +164,68 @@ pub fn join(
     right_keys: &[&str],
     how: JoinType,
 ) -> Result<RecordBatch> {
+    join_impl(left, right, left_keys, right_keys, how, false)
+}
+
+/// Same as [`join`], except a null key matches another null key instead of never
+/// matching anything.
+///
+/// Spark's own `DataFrame.join` never does this (see [`join`]'s docs for why), so this
+/// exists only for a caller who has a specific, deliberate reason to treat null keys as
+/// equal to each other; reach for [`join`] by default. Matching is exactly
+/// `RowConverter`'s own per-column byte comparison with no exclusion applied: a null in
+/// one key column matches a null in the same key column on the other side, and every
+/// other, non-null key column still needs an exact match, so a partial-null composite
+/// key is not treated as a wildcard, only that one column's null is.
+///
+/// # Errors
+///
+/// Same as [`join`].
+///
+/// # Panics
+///
+/// Does not panic. Same complexity as [`join`].
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Arc;
+/// use arrow_array::{Int64Array, RecordBatch};
+/// use arrow_schema::{DataType, Field, Schema};
+/// use witchhat_core::{JoinType, join_null_safe};
+///
+/// let left = RecordBatch::try_new(
+///     Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)])),
+///     vec![Arc::new(Int64Array::from(vec![None, Some(1)]))],
+/// )
+/// .unwrap();
+/// let right = RecordBatch::try_new(
+///     Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)])),
+///     vec![Arc::new(Int64Array::from(vec![None]))],
+/// )
+/// .unwrap();
+///
+/// let out = join_null_safe(&left, &right, &["k"], &["k"], JoinType::Inner).unwrap();
+/// assert_eq!(out.num_rows(), 1); // the two null keys matched
+/// ```
+pub fn join_null_safe(
+    left: &RecordBatch,
+    right: &RecordBatch,
+    left_keys: &[&str],
+    right_keys: &[&str],
+    how: JoinType,
+) -> Result<RecordBatch> {
+    join_impl(left, right, left_keys, right_keys, how, true)
+}
+
+fn join_impl(
+    left: &RecordBatch,
+    right: &RecordBatch,
+    left_keys: &[&str],
+    right_keys: &[&str],
+    how: JoinType,
+    null_safe: bool,
+) -> Result<RecordBatch> {
     if left_keys.is_empty() || right_keys.len() != left_keys.len() {
         return Err(Error::config(
             "left_keys and right_keys must be the same non-zero length",
@@ -165,13 +257,33 @@ pub fn join(
         .convert_columns(&right_key_columns)
         .map_err(|e| Error::config(e.to_string()))?;
 
-    let right_index = row_index(&right_rows);
+    // In non-null-safe mode a null-keyed row is excluded from the index (so it can
+    // never be matched-into) and from probing (so it never matches out), which
+    // together mean it always ends up on the "unmatched" side, as Spark's equi-join
+    // semantics require.
+    let left_null = if null_safe {
+        vec![false; left.num_rows()]
+    } else {
+        null_mask(&left_key_columns, left.num_rows())
+    };
+    let right_null = if null_safe {
+        vec![false; right.num_rows()]
+    } else {
+        null_mask(&right_key_columns, right.num_rows())
+    };
+
+    let right_index = row_index(&right_rows, &right_null);
     let mut right_matched = vec![false; right.num_rows()];
     let mut left_out: Vec<Option<u32>> = Vec::new();
     let mut right_out: Vec<Option<u32>> = Vec::new();
 
     for (li, lrow) in left_rows.iter().enumerate() {
-        match right_index.get(&lrow.owned()) {
+        let matches = if left_null[li] {
+            None
+        } else {
+            right_index.get(&lrow.owned())
+        };
+        match matches {
             Some(matches) => {
                 for &ri in matches {
                     left_out.push(Some(li as u32));
@@ -370,5 +482,77 @@ mod tests {
         let out = join(&left, &right, &["a", "b"], &["a", "b"], JoinType::Inner).unwrap();
         assert_eq!(out.num_rows(), 1);
         assert_eq!(out.column(4).as_primitive::<Int64Type>().value(0), 100);
+    }
+
+    #[test]
+    fn null_keys_never_match_by_default() {
+        let left = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)])),
+            vec![Arc::new(Int64Array::from(vec![None, Some(1)]))],
+        )
+        .unwrap();
+        let right = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)])),
+            vec![Arc::new(Int64Array::from(vec![None, Some(1)]))],
+        )
+        .unwrap();
+
+        // an inner join only matches the (1, 1) pair; the two nulls do not match
+        let out = join(&left, &right, &["k"], &["k"], JoinType::Inner).unwrap();
+        assert_eq!(out.num_rows(), 1);
+        assert_eq!(out.column(0).as_primitive::<Int64Type>().value(0), 1);
+
+        // a full join surfaces each null-keyed row once, from each side, as unmatched
+        let out = join(&left, &right, &["k"], &["k"], JoinType::Full).unwrap();
+        assert_eq!(out.num_rows(), 3);
+    }
+
+    #[test]
+    fn null_keys_match_under_join_null_safe() {
+        let left = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)])),
+            vec![Arc::new(Int64Array::from(vec![None, Some(1)]))],
+        )
+        .unwrap();
+        let right = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)])),
+            vec![Arc::new(Int64Array::from(vec![None, Some(1)]))],
+        )
+        .unwrap();
+
+        let out = join_null_safe(&left, &right, &["k"], &["k"], JoinType::Inner).unwrap();
+        assert_eq!(out.num_rows(), 2); // null x null, and 1 x 1
+    }
+
+    #[test]
+    fn partial_null_composite_key_still_needs_exact_match_on_null_safe() {
+        // (null, "x") on the left should not match (null, "y") on the right even under
+        // join_null_safe: only the first column's null is a wildcard-of-one, the second
+        // column still requires an exact match.
+        let left = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("a", DataType::Int64, true),
+                Field::new("b", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![None])),
+                Arc::new(StringArray::from(vec!["x"])),
+            ],
+        )
+        .unwrap();
+        let right = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("a", DataType::Int64, true),
+                Field::new("b", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![None])),
+                Arc::new(StringArray::from(vec!["y"])),
+            ],
+        )
+        .unwrap();
+
+        let out = join_null_safe(&left, &right, &["a", "b"], &["a", "b"], JoinType::Inner).unwrap();
+        assert_eq!(out.num_rows(), 0);
     }
 }

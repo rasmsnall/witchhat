@@ -23,8 +23,11 @@ count, and an order-independent fingerprint of their rows) and returns an
 :class:`EquivalenceReport`.
 
 Native transformations: :func:`drop_duplicates` (equivalent to Spark's
-``dropDuplicates``), :func:`join` (inner/left/right/full, matched on key columns), and
-:func:`aggregate` (group by columns, reduce with count/sum/mean/min/max).
+``dropDuplicates``, exact even under a hash collision), :func:`join` (inner/left/
+right/full, matched on key columns, excluding null keys the same way Spark does;
+:func:`join_null_safe` is the explicit opt-in for null-matches-null), and
+:func:`aggregate` (group by columns, reduce with count/sum/mean/min/max, each summed
+and compared at its own exact numeric precision, never downcast through ``f64``).
 
 :func:`cpu_features` reports what SIMD dispatch this machine would get from a future
 accelerated kernel.
@@ -54,6 +57,7 @@ from ._witchhat import drop_duplicates as _drop_duplicates
 from ._witchhat import hash_rows as _hash_rows
 from ._witchhat import hash_rows_all_columns as _hash_rows_all_columns
 from ._witchhat import join as _join
+from ._witchhat import join_null_safe as _join_null_safe
 from ._witchhat import normalize_json as _normalize_json
 from ._witchhat import schema_fingerprint as _schema_fingerprint
 from ._witchhat import table_fingerprint as _table_fingerprint
@@ -212,6 +216,22 @@ def join(left, right, left_keys, right_keys, how="inner"):
 join.__doc__ = _join.__doc__
 
 
+def join_null_safe(left, right, left_keys, right_keys, how="inner"):
+    if not metrics.is_enabled():
+        return _join_null_safe(left, right, left_keys, right_keys, how)
+    with metrics.measure(
+        "join_null_safe", left_keys=list(left_keys), right_keys=list(right_keys), how=how
+    ) as event:
+        event["rows_in"] = metrics.row_count(left)
+        event["rows_in_right"] = metrics.row_count(right)
+        result = _join_null_safe(left, right, left_keys, right_keys, how)
+        event["rows_out"] = metrics.row_count(result)
+        return result
+
+
+join_null_safe.__doc__ = _join_null_safe.__doc__
+
+
 def aggregate(batch, group_by, aggregations):
     if not metrics.is_enabled():
         return _aggregate(batch, group_by, aggregations)
@@ -242,6 +262,7 @@ __all__ = [
     "EquivalenceReport",
     "drop_duplicates",
     "join",
+    "join_null_safe",
     "aggregate",
     "cpu_features",
     "CpuFeatures",

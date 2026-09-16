@@ -4,7 +4,7 @@
 **Status** Eight kernels (composite hashing, schema validation, JSON normalization, regex cleanup, output-equivalence testing, deduplication, join, aggregate) are implemented end to end, behind both the Rust and the Python surface, plus a Spark/Databricks integration layer (Chapter XVI) and optional JSON metric logging (Chapter XVII). Filter and project need no witchhat-specific kernel (Arrow's own compute kernels already cover them); see Chapter XX for what remains.
 **Audience** Anyone integrating, operating, or extending this library. No prior context assumed.
 **Companion documents** `api.md` for the callable surface, `operations.md` for building and deploying it.
-**Version** 1.6
+**Version** 1.7
 **Date** 2026-09-16
 
 ---
@@ -47,11 +47,12 @@
   - 1. What it computes
   - 2. Why not built on `hash_batch`
   - 3. Column-name collisions and nullability
-  - 4. Row order
+  - 4. Null key semantics: `join` versus `join_null_safe`
+  - 5. Row order
 - X. Aggregate
   - 1. What it computes
   - 2. Why group keys use the same row format as join
-  - 3. Min/Max preserve type; Sum/Mean go through `f64`
+  - 3. Numeric accumulation and comparison are type-specific, not a universal `f64`
   - 4. The empty-`group_by` case
 - XI. CPU Feature Detection
   - 1. What it does today
@@ -440,11 +441,17 @@ asked is "are these the same", not "would `actual` be a safe evolution of `expec
 ### 1. What it computes
 
 `drop_duplicates(batch, columns, version)` is a native transformation equivalent to
-Spark's `df.dropDuplicates(subset=columns)`. It reuses `hash_batch` as the dedup key: one
-pass computes each row's composite hash over `columns`, a `HashSet<u64>` tracks which
-hashes have been seen, and `arrow_select::filter::filter_record_batch` keeps only the
-rows whose hash was new. Which row survives within a duplicate group is always the first
-one by input order, unlike Spark's own `dropDuplicates`, whose choice there is
+Spark's `df.dropDuplicates(subset=columns)`. It uses `hash_batch`'s composite hash over
+`columns` as a bucketing key, not as the final answer: rows sharing a hash are bucketed
+together, and only rows within the same bucket are compared with
+`arrow_row::RowConverter`'s exact, byte-comparable row format (the same one `join`/
+`aggregate` use, Chapter IX, Section 2) before either is treated as a duplicate of the
+other. A `u64` fingerprint collision between two genuinely distinct rows therefore
+narrows the comparison work, never substitutes for it: unlike `table_fingerprint`
+(Chapter VII), where a collision is an acceptable, documented risk, a collision here must
+not silently drop a valid, distinct row. `arrow_select::filter::filter_record_batch`
+keeps only the rows that survived. Which row survives within a duplicate group is always
+the first one by input order, unlike Spark's own `dropDuplicates`, whose choice there is
 unspecified.
 
 ### 2. Why filter and project are not wrapped here
@@ -499,7 +506,25 @@ nullability: an outer join can always introduce a null on either side, and a sch
 should never promise "never null" for a column that can, in fact, be null under a
 different `how` than the one just used.
 
-### 4. Row order
+### 4. Null key semantics: `join` versus `join_null_safe`
+
+`RowConverter`'s byte comparison alone treats two nulls in the same key column as equal
+(they encode to the same byte pattern), which is not what Spark/SQL means by an
+equi-join: `NULL = NULL` evaluates to `NULL`, not `true`, so a null key never matches
+anything under Spark's own `DataFrame.join`, including another null key. `join` matches
+that by construction: before probing, every row with a null in any of `left_keys`/
+`right_keys` is excluded from the match index and from probing, so it can only ever end
+up on the "unmatched" side (present under `Left`/`Full` for a null-keyed `left` row, or
+`Right`/`Full` for a null-keyed `right` row, absent otherwise) — never matched, not even
+against another row that is also all-null in the same columns. `join_null_safe` is the
+explicit, separately-named opt-in for the opposite behaviour: no exclusion is applied, so
+`RowConverter`'s own per-column comparison decides, and a null in one key column matches
+a null in the same key column on the other side (a partial-null composite key still needs
+an exact match on its other, non-null columns; only that one column's null is a match).
+Two entry points rather than a flag because a caller reading `join(...)` at a call site
+should not have to open the function to learn which SQL null semantics it uses.
+
+### 5. Row order
 
 Every `left` row in its original order, each repeated once per match (or once with null
 `right` columns, under `Left`/`Full`, if unmatched), followed by every unmatched `right`
@@ -519,8 +544,8 @@ reduces each group's columns with the given `aggregations`.
 | Function | Input types | Output | Null handling |
 |---|---|---|---|
 | `Count` | any | `Int64` | Counts non-null values |
-| `Sum` | numeric (Table 3-2's numeric subset) | `Float64` | `None` if every value in the group is null |
-| `Mean` | numeric | `Float64` | `None` if every value in the group is null |
+| `Sum` | numeric (Table 3-2's numeric subset, plus `Decimal128`/`Decimal256`) | `Int64` (signed source), `UInt64` (unsigned source), `Float64` (float source), or the source's own `Decimal128`/`Decimal256` type | `None` if every value in the group is null |
+| `Mean` | numeric | `Float64` (integer/float source) or the source's own `Decimal128`/`Decimal256` type | `None` if every value in the group is null |
 | `Min` | numeric | matches input | `None` if every value in the group is null |
 | `Max` | numeric | matches input | `None` if every value in the group is null |
 
@@ -533,17 +558,39 @@ uses, for the same reason, rather than `hash_batch`'s fingerprint. Group order i
 output is first-seen order (the order each distinct key first appears in `batch`), the
 same convention `dedup` (Chapter VIII) uses for surviving rows.
 
-### 3. Min/Max preserve type; Sum/Mean go through `f64`
+### 3. Numeric accumulation and comparison are type-specific, not a universal `f64`
 
-`Sum` and `Mean` accumulate through `f64` regardless of the input's integer or float
-type, which is unavoidable for a sum that must not overflow a fixed-width integer type,
-but does mean an `Int64`/`UInt64` value beyond `f64`'s exact-integer range (±2^53) can
-lose precision in the accumulated result. `Min`/`Max` avoid this for the *output* value:
-rather than converting to compare, then returning the converted value, they use the
-`f64` conversion only to find which row is the extreme value, then `take` that row's
-original, untouched value from the source array — so a `Min` of an `Int64` column stays
-an exact `Int64`, and only the comparison step (not the returned value) has `f64`'s
-precision limit.
+An internal `Num` type carries a value at its own exact precision: a signed integer
+column's value widens losslessly into `i128`, an unsigned integer column's into `u128`,
+and a `Decimal128`/`Decimal256` column's raw mantissa stays at its native width (the
+scale is fixed per column, so summing/comparing mantissas directly is exactly summing/
+comparing the decimal values they represent). `Sum`'s accumulation and `Min`/`Max`'s
+comparison both go through `Num`, so an `Int64`/`UInt64` value beyond `f64`'s
+exact-integer range (±2^53) is summed and compared exactly, and two distinct large
+integers never compare equal merely because they rounded to the same `f64` — the concrete
+failure mode this replaces. `Sum`'s exact accumulator is checked (`i128`/`u128`/decimal
+mantissa `checked_add`), so an accumulation the accumulator cannot represent is a hard
+`Overflow` error, never a silent wraparound; the same check applies again narrowing the
+final `i128`/`u128` total into the output `Int64`/`UInt64` array.
+
+`f64` is still used, deliberately, in two places: as the exact, native representation of
+an actual `Float32`/`Float64` column (nothing more exact would be truthful there), and as
+`Mean`'s single *final* division for a non-decimal source. That division is unavoidably
+approximate (a mean is generally fractional regardless of input type, matching how
+Spark's own `avg()` on an integral column returns a double), but what changed is that the
+summation feeding it is exact — error no longer compounds across every row the way
+repeated `f64` addition's would, only the one, unavoidable, final division is
+approximate. `Mean` of a `Decimal128`/`Decimal256` source stays decimal instead: the
+mantissa is integer-divided by the group's count, truncating any remainder rather than
+rounding half-up.
+
+`Min`/`Max` never touch `f64` for a `Decimal`/integer source at all, comparison or
+output: they compare via `Num`, then `take` the winning row's original, untouched value
+from the source array, so a `Min` of an `Int64` column stays an exact `Int64` all the
+way through.
+
+`Date`/`Time`/`Timestamp` aggregation is not implemented yet (Chapter XX); when it is, it
+belongs in `Num` the same way, as a native integer representation, not through `f64`.
 
 ### 4. The empty-`group_by` case
 
@@ -581,10 +628,15 @@ carry a differential test asserting exactly that.
 
 Every function in `witchhat-core` is synchronous, single-threaded, and allocation-bounded
 by its input size; none spawn threads, perform I/O, or hold a lock across a call. The
-PyO3 boundary (Chapter XV) does not release the GIL during a call, because every
-current operation is CPU-bound and short relative to the cost of a Python call itself.
-This is expected to change once a kernel is expensive enough that releasing the GIL for
-the duration becomes worth its own overhead; Chapter XX tracks it as an open item.
+PyO3 boundary (Chapter XV) releases the GIL for the duration of every kernel call, via
+`Python::allow_threads` (pyo3 0.25.1's name for this; a later pyo3 renamed it
+`Python::detach`, but this crate is pinned to `pyo3 = "=0.25.1"`, Chapter XV Section 1).
+By the time a `#[pyfunction]`'s body runs, pyo3 has already finished extracting every
+argument into an owned Rust value, so the kernel call itself touches no Python object and
+is safe to run with the GIL released; only building the returned value afterward needs
+the GIL back, which happens automatically once `allow_threads` returns. This lets other
+Python threads, notably a Spark executor's other `mapInArrow` work, run while a
+CPU-bound kernel is in flight instead of blocking on it.
 
 ## XIII. Failure Model
 
@@ -739,6 +791,15 @@ and joined locally against each partition's batch with `witchhat.join`. A large-
 join is explicitly out of scope for this function; `DataFrame.join` remains the right
 tool for that, not something to route through a per-partition Python call.
 
+`how="right"`/`how="full"` are rejected outright (`ValueError`), not merely discouraged:
+`small_table` is broadcast independently to *every* partition, with no coordination
+between them, so under those two modes an unmatched `small_table` row would be produced
+once per partition instead of once overall — silently wrong output, not just surprising.
+A large-large join with genuine `right`/`full` semantics needs the partition coordination
+this broadcast pattern structurally cannot give it, so the fix is to refuse those two
+modes rather than attempt a "mostly working" approximation; `DataFrame.join` is the right
+tool when that coordination is actually needed.
+
 ## XVII. Metric Logging
 
 ### 1. What it computes
@@ -801,7 +862,8 @@ internals, for a problem the callable sink already lets a caller solve in their 
 |---|---|
 | `arrow-array`, `arrow-schema`, `arrow-data` | The data model (Chapter II); `witchhat-core` depends on the first two only |
 | `arrow-select` | `filter_record_batch`/`take`, underlying `dedup`, `join` and `aggregate`'s output construction |
-| `arrow-row` | `RowConverter`, underlying `join` (Chapter IX) and `aggregate`'s (Chapter X) grouping/matching |
+| `arrow-row` | `RowConverter`, underlying `join` (Chapter IX), `dedup`'s exact-equality fallback (Chapter VIII) and `aggregate`'s (Chapter X) grouping/matching |
+| `arrow-buffer` | `i256`, `aggregate`'s `Decimal256` accumulator/comparator (Chapter X, Section 3) |
 | `arrow` (feature `pyarrow`) | Zero-copy conversion at the PyO3 boundary, `witchhat-py` only |
 | `xxhash-rust` (feature `xxh3`) | The per-value hash function underlying `hash_batch` |
 | `serde_json` | JSON parsing for `normalize_json` (Chapter V) |
@@ -825,7 +887,22 @@ Pinned 2026-09 (probed via `cargo build`; crates.io index reachable): `arrow 56.
   just whether they do, so a caller can act on the specific difference.
 - `join` and `aggregate` use the correctness-appropriate tool (`arrow_row`'s exact byte
   comparison) rather than reusing `hash_batch`'s probabilistic fingerprint where a
-  collision would silently produce wrong data, not just weaker evidence.
+  collision would silently produce wrong data, not just weaker evidence; `dedup` also
+  uses `hash_batch` only as a bucketing key, falling back to the same exact comparison
+  within a bucket, so a fingerprint collision there cannot silently drop a valid row
+  either (Chapter VIII).
+- `aggregate`'s `Sum`/`Mean`/`Min`/`Max` accumulate and compare at each numeric column's
+  own exact precision (`i128`/`u128`/decimal mantissa), not through a universal `f64`
+  downcast, so a value or a sum beyond `f64`'s exact-integer range (±2^53) stays exact,
+  and `Sum`'s accumulator overflowing is a hard error, not a silent wraparound
+  (Chapter X, Section 3).
+- `join`'s null key semantics match Spark/SQL by default (a null key never matches,
+  including another null key), with `join_null_safe` as an explicit, separately-named
+  opt-in for the opposite, rather than one function silently doing whichever Rust's
+  `RowConverter` happens to do (Chapter IX, Section 4).
+- Every PyO3-bound kernel call releases the GIL for its duration, so it does not block
+  other Python threads (notably a Spark executor's other `mapInArrow` work) while it
+  runs (Chapter XII).
 - Deduplication reuses the hashing kernel rather than adding a second row-comparison
   algorithm; filter and project were left to Arrow's own kernels rather than reinvented.
 - `witchhat.spark`'s partition-coordinating wrappers default to *correct*
@@ -850,14 +927,15 @@ Pinned 2026-09 (probed via `cargo build`; crates.io index reachable): `arrow 56.
 - `validate_schema`'s numeric-widening table is deliberately narrower than Spark's own
   implicit-cast rules; a schema comparison Spark would accept silently can still be
   reported as retyped here.
-- `aggregate`'s `Sum`/`Mean`/`Min`/`Max` are limited to the numeric subset of Table 3-2
-  (no string min/max, no date/timestamp/decimal aggregation yet), and `Sum`/`Mean`
-  accumulate through `f64` (Chapter X, Section 3).
+- `aggregate`'s `Sum`/`Mean`/`Min`/`Max` cover the numeric subset of Table 3-2 plus
+  `Decimal128`/`Decimal256`; string min/max and date/timestamp aggregation are still
+  unbuilt (Chapter X, Section 1).
 - `join` requires an exact Arrow type match between paired key columns; no implicit
   coercion, matching `validate_schema`'s own conservatism (Chapter IV, Section 2).
-- `witchhat.spark.broadcast_join` covers only the broadcast pattern; a large-large
-  shuffle join has no witchhat-provided path and is left to `DataFrame.join` itself
-  (Chapter XVI, Section 5).
+- `witchhat.spark.broadcast_join` covers only the broadcast pattern (and only its
+  `"inner"`/`"left"` modes, Chapter XVI Section 5); a large-large shuffle join, or a
+  broadcast join with genuine `"right"`/`"full"` semantics, has no witchhat-provided
+  path and is left to `DataFrame.join` itself.
 - Metric logging has no built-in cross-executor aggregation; a distributed job's events
   land wherever each partition's task ran unless the caller supplies a sink that
   collects them itself (Chapter XVII, Section 4).
@@ -884,12 +962,30 @@ Pinned 2026-09 (probed via `cargo build`; crates.io index reachable): `arrow 56.
 Implemented and tested: composite row/table hashing (now covering Date/Time/Timestamp/
 Decimal in addition to the original numeric/string/binary set), schema fingerprinting
 and validation, JSON normalization, regex cleanup (ad hoc and presets),
-output-equivalence testing, deduplication, join (inner/left/right/full), aggregate
-(count/sum/mean/min/max), CPU feature detection, the Python binding boundary, a
-Databricks/Spark integration layer (`witchhat.spark`, Chapter XVI), optional JSON metric
-logging (`witchhat.metrics`, Chapter XVII, instrumenting `witchhat.spark` transitively),
-the `abi3-py310` wheel build now cross-built for both `x86_64` and `aarch64` (Graviton)
-manylinux targets.
+output-equivalence testing, deduplication (exact even under a hash collision, Chapter
+VIII), join (inner/left/right/full, excluding null keys by default with `join_null_safe`
+as the explicit opt-in, Chapter IX Section 4), aggregate (count/sum/mean/min/max, summed
+and compared at each column's own exact numeric precision, never downcast through `f64`,
+Chapter X Section 3), CPU feature detection, the Python binding boundary (every kernel
+call releases the GIL for its duration, Chapter XV), a Databricks/Spark integration layer
+(`witchhat.spark`, Chapter XVI, `broadcast_join` rejecting `"right"`/`"full"` outright as
+unsound under per-partition broadcast), optional JSON metric logging (`witchhat.metrics`,
+Chapter XVII, instrumenting `witchhat.spark` transitively), the `abi3-py310` wheel build
+now cross-built for both `x86_64` and `aarch64` (Graviton) manylinux targets.
+
+An external code review (2026-09-16) found the five correctness gaps just listed
+(deduplication collision risk, join null semantics, aggregate `f64` precision,
+`broadcast_join` right/full unsoundness, GIL retention) in code that had previously only
+documented them as caveats; all five are now fixed, not just documented. The same review
+raised several lower-priority items not yet acted on: whole Spark partitions are
+buffered in memory rather than streamed (Chapter XVI, Section 2); `check_equivalence` is
+fingerprint-only, with no schema-plus-exact-row-comparison mode; the `regex` crate's
+syntax is not Spark/Java regex syntax and the gap is undocumented; no benchmark proves a
+Spark-side win net of JVM/Arrow conversion overhead; `witchhat.spark`/`mapInArrow` has no
+CI coverage, only the manual `tools/spark_smoke.py`; the release profile's
+`panic = "abort"` means an unexpected Rust panic still kills the whole Python worker
+instead of raising a catchable exception; wheels carry no provenance (checksums, source
+commit SHA, SBOM, signing) tying them to the source they were built from.
 
 Publishing to a package repository and verifying installation from a Unity Catalog
 Volume against a live workspace were both raised and then deliberately decided against

@@ -7,10 +7,17 @@
 //! re-exports everything registered here, so callers import from `witchhat`, not
 //! `witchhat._witchhat`.
 //!
-//! Everything here executes on the thread that called into it: no GIL release, no
-//! background threads, since every operation is CPU-bound and short relative to a Python
-//! call's own overhead. Revisit if a future kernel is expensive enough to be worth
-//! releasing the GIL for during the call.
+//! Every function that runs a `witchhat_core` kernel over row/array data releases the
+//! GIL for the duration of that call, via `Python::allow_threads` (pyo3 0.25.1's name
+//! for this; later pyo3 renamed it `Python::detach`, but this crate is pinned to
+//! `pyo3 = "=0.25.1"`, see `CLAUDE.md`). By the time a function's body runs, pyo3 has
+//! already finished extracting every argument from Python into owned Rust values
+//! (`PyArrowType<RecordBatch>`'s inner `RecordBatch`, `Vec<String>`, and so on), so the
+//! kernel call itself touches no Python object and is safe to run with the GIL released;
+//! only building the returned `PyArrowType`/`PyResult` afterward needs the GIL back,
+//! which happens automatically once `allow_threads` returns. This lets other Python
+//! threads (a Spark executor's other `mapInArrow` work, in particular) run while a
+//! CPU-bound kernel is in flight instead of blocking on it.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -72,13 +79,18 @@ fn string_array_from_pyarrow(array: PyArrowType<ArrayData>) -> StringArray {
 #[pyfunction]
 #[pyo3(signature = (batch, columns, version = "v1"))]
 fn hash_rows(
+    py: Python<'_>,
     batch: PyArrowType<RecordBatch>,
     columns: Vec<String>,
     version: &str,
 ) -> PyResult<PyArrowType<ArrayData>> {
     let version = parse_version(version)?;
-    let names: Vec<&str> = columns.iter().map(String::as_str).collect();
-    let hashes = witchhat_core::hash_batch(&batch.0, &names, version)
+    let names: Vec<String> = columns;
+    let hashes = py
+        .allow_threads(|| {
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            witchhat_core::hash_batch(&batch.0, &names, version)
+        })
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     Ok(u64_array_to_pyarrow(hashes))
 }
@@ -88,11 +100,13 @@ fn hash_rows(
 #[pyfunction]
 #[pyo3(signature = (batch, version = "v1"))]
 fn hash_rows_all_columns(
+    py: Python<'_>,
     batch: PyArrowType<RecordBatch>,
     version: &str,
 ) -> PyResult<PyArrowType<ArrayData>> {
     let version = parse_version(version)?;
-    let hashes = witchhat_core::hash_batch_all_columns(&batch.0, version)
+    let hashes = py
+        .allow_threads(|| witchhat_core::hash_batch_all_columns(&batch.0, version))
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     Ok(u64_array_to_pyarrow(hashes))
 }
@@ -104,12 +118,14 @@ fn hash_rows_all_columns(
 /// sorting either side first. Raises `ValueError` for an unrecognised `version`.
 #[pyfunction]
 #[pyo3(signature = (row_hashes, version = "v1"))]
-fn table_fingerprint(row_hashes: PyArrowType<ArrayData>, version: &str) -> PyResult<u64> {
+fn table_fingerprint(
+    py: Python<'_>,
+    row_hashes: PyArrowType<ArrayData>,
+    version: &str,
+) -> PyResult<u64> {
     let version = parse_version(version)?;
-    Ok(witchhat_core::table_fingerprint(
-        &u64_array_from_pyarrow(row_hashes),
-        version,
-    ))
+    let hashes = u64_array_from_pyarrow(row_hashes);
+    Ok(py.allow_threads(|| witchhat_core::table_fingerprint(&hashes, version)))
 }
 
 /// Fingerprint `schema`'s shape: field names in order, their types, and their
@@ -268,13 +284,15 @@ impl PyNormalizeStats {
 #[pyfunction]
 #[pyo3(signature = (json, schema, version = "v1"))]
 fn normalize_json(
+    py: Python<'_>,
     json: PyArrowType<ArrayData>,
     schema: PyArrowType<witchhat_core::Schema>,
     version: &str,
 ) -> PyResult<(PyArrowType<RecordBatch>, PyNormalizeStats)> {
     let version = parse_normalize_version(version)?;
     let array = string_array_from_pyarrow(json);
-    let (batch, stats) = witchhat_core::normalize_json(&array, &schema.0, version)
+    let (batch, stats) = py
+        .allow_threads(|| witchhat_core::normalize_json(&array, &schema.0, version))
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     Ok((
         PyArrowType(batch),
@@ -295,13 +313,15 @@ fn normalize_json(
 #[pyfunction]
 #[pyo3(signature = (input, name, version = "v1"))]
 fn clean_with_preset(
+    py: Python<'_>,
     input: PyArrowType<ArrayData>,
     name: &str,
     version: &str,
 ) -> PyResult<PyArrowType<ArrayData>> {
     let version = parse_cleanup_version(version)?;
     let array = string_array_from_pyarrow(input);
-    let out = witchhat_core::clean_with_preset(&array, name, version)
+    let out = py
+        .allow_threads(|| witchhat_core::clean_with_preset(&array, name, version))
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
     Ok(string_array_to_pyarrow(out))
 }
@@ -314,6 +334,7 @@ fn clean_with_preset(
 #[pyfunction]
 #[pyo3(signature = (input, rules))]
 fn clean_with_rules(
+    py: Python<'_>,
     input: PyArrowType<ArrayData>,
     rules: Vec<(String, String)>,
 ) -> PyResult<PyArrowType<ArrayData>> {
@@ -323,9 +344,8 @@ fn clean_with_rules(
         .map(|(pattern, replacement)| witchhat_core::CleanRule::new(&pattern, replacement))
         .collect();
     let compiled = compiled.map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok(string_array_to_pyarrow(witchhat_core::apply_rules(
-        &array, &compiled,
-    )))
+    let out = py.allow_threads(|| witchhat_core::apply_rules(&array, &compiled));
+    Ok(string_array_to_pyarrow(out))
 }
 
 /// The result of comparing an actual batch against an expected one.
@@ -386,6 +406,7 @@ impl PyEquivalenceReport {
 #[pyfunction]
 #[pyo3(signature = (actual, expected, columns = None, allow_numeric_widening = false, hash_version = "v1"))]
 fn check_equivalence(
+    py: Python<'_>,
     actual: PyArrowType<RecordBatch>,
     expected: PyArrowType<RecordBatch>,
     columns: Option<Vec<String>>,
@@ -400,7 +421,8 @@ fn check_equivalence(
             allow_numeric_widening,
         },
     };
-    let report = witchhat_core::check_equivalence(&actual.0, &expected.0, options)
+    let report = py
+        .allow_threads(|| witchhat_core::check_equivalence(&actual.0, &expected.0, options))
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     Ok(PyEquivalenceReport {
         schema_diff: to_py_schema_diff(report.schema_diff),
@@ -419,13 +441,17 @@ fn check_equivalence(
 #[pyfunction]
 #[pyo3(signature = (batch, columns, version = "v1"))]
 fn drop_duplicates(
+    py: Python<'_>,
     batch: PyArrowType<RecordBatch>,
     columns: Vec<String>,
     version: &str,
 ) -> PyResult<PyArrowType<RecordBatch>> {
     let version = parse_version(version)?;
-    let names: Vec<&str> = columns.iter().map(String::as_str).collect();
-    let deduped = witchhat_core::drop_duplicates(&batch.0, &names, version)
+    let deduped = py
+        .allow_threads(|| {
+            let names: Vec<&str> = columns.iter().map(String::as_str).collect();
+            witchhat_core::drop_duplicates(&batch.0, &names, version)
+        })
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     Ok(PyArrowType(deduped))
 }
@@ -436,13 +462,16 @@ fn parse_join_type(how: &str) -> PyResult<witchhat_core::JoinType> {
 }
 
 /// Joins `left` and `right` on `left_keys`/`right_keys`, matched pairwise by position.
-/// `how` is `"inner"`, `"left"`, `"right"` or `"full"`. See `witchhat.join`'s docstring
-/// for the output schema (column-name collisions, nullability) and row order.
-/// Raises `ValueError` for an unrecognised `how`, `RuntimeError` for an unknown column
-/// or a key-type mismatch between `left_keys[i]` and `right_keys[i]`.
+/// `how` is `"inner"`, `"left"`, `"right"` or `"full"`. A row with a null in any key
+/// column never matches, the same as Spark/SQL (`NULL = NULL` is never true); use
+/// `join_null_safe` for the opposite. See `witchhat.join`'s docstring for the output
+/// schema (column-name collisions, nullability) and row order. Raises `ValueError` for
+/// an unrecognised `how`, `RuntimeError` for an unknown column or a key-type mismatch
+/// between `left_keys[i]` and `right_keys[i]`.
 #[pyfunction]
 #[pyo3(signature = (left, right, left_keys, right_keys, how = "inner"))]
 fn join(
+    py: Python<'_>,
     left: PyArrowType<RecordBatch>,
     right: PyArrowType<RecordBatch>,
     left_keys: Vec<String>,
@@ -450,9 +479,37 @@ fn join(
     how: &str,
 ) -> PyResult<PyArrowType<RecordBatch>> {
     let how = parse_join_type(how)?;
-    let left_names: Vec<&str> = left_keys.iter().map(String::as_str).collect();
-    let right_names: Vec<&str> = right_keys.iter().map(String::as_str).collect();
-    let out = witchhat_core::join(&left.0, &right.0, &left_names, &right_names, how)
+    let out = py
+        .allow_threads(|| {
+            let left_names: Vec<&str> = left_keys.iter().map(String::as_str).collect();
+            let right_names: Vec<&str> = right_keys.iter().map(String::as_str).collect();
+            witchhat_core::join(&left.0, &right.0, &left_names, &right_names, how)
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    Ok(PyArrowType(out))
+}
+
+/// Same as `join`, except a null key matches another null key instead of never
+/// matching anything. See `witchhat.join_null_safe`'s Rust docstring for the exact
+/// per-column null-matching rule on a composite key. Reach for `join` by default;
+/// this exists for a caller with a specific, deliberate reason to want it.
+#[pyfunction]
+#[pyo3(signature = (left, right, left_keys, right_keys, how = "inner"))]
+fn join_null_safe(
+    py: Python<'_>,
+    left: PyArrowType<RecordBatch>,
+    right: PyArrowType<RecordBatch>,
+    left_keys: Vec<String>,
+    right_keys: Vec<String>,
+    how: &str,
+) -> PyResult<PyArrowType<RecordBatch>> {
+    let how = parse_join_type(how)?;
+    let out = py
+        .allow_threads(|| {
+            let left_names: Vec<&str> = left_keys.iter().map(String::as_str).collect();
+            let right_names: Vec<&str> = right_keys.iter().map(String::as_str).collect();
+            witchhat_core::join_null_safe(&left.0, &right.0, &left_names, &right_names, how)
+        })
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     Ok(PyArrowType(out))
 }
@@ -471,11 +528,11 @@ fn parse_agg_func(func: &str) -> PyResult<witchhat_core::AggFunc> {
 #[pyfunction]
 #[pyo3(signature = (batch, group_by, aggregations))]
 fn aggregate(
+    py: Python<'_>,
     batch: PyArrowType<RecordBatch>,
     group_by: Vec<String>,
     aggregations: Vec<(String, String, String)>,
 ) -> PyResult<PyArrowType<RecordBatch>> {
-    let group_names: Vec<&str> = group_by.iter().map(String::as_str).collect();
     let aggs: Vec<witchhat_core::Aggregation> = aggregations
         .into_iter()
         .map(|(column, func, alias)| {
@@ -486,7 +543,11 @@ fn aggregate(
             ))
         })
         .collect::<PyResult<_>>()?;
-    let out = witchhat_core::aggregate(&batch.0, &group_names, &aggs)
+    let out = py
+        .allow_threads(|| {
+            let group_names: Vec<&str> = group_by.iter().map(String::as_str).collect();
+            witchhat_core::aggregate(&batch.0, &group_names, &aggs)
+        })
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     Ok(PyArrowType(out))
 }
@@ -552,6 +613,7 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(check_equivalence, module)?)?;
     module.add_function(wrap_pyfunction!(drop_duplicates, module)?)?;
     module.add_function(wrap_pyfunction!(join, module)?)?;
+    module.add_function(wrap_pyfunction!(join_null_safe, module)?)?;
     module.add_function(wrap_pyfunction!(aggregate, module)?)?;
     module.add_function(wrap_pyfunction!(cpu_features, module)?)?;
     Ok(())

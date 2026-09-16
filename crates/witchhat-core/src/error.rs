@@ -40,6 +40,14 @@ pub enum Error {
     /// A caller supplied an invalid combination of arguments.
     #[error("invalid configuration: {0}")]
     Config(Arc<str>),
+
+    /// An exact accumulator (e.g. `aggregate`'s type-specific `i128`/`u128`/decimal
+    /// summation) exceeded its range. Deliberately a hard error rather than a silent
+    /// wraparound or a lossy fallback: the whole point of the exact accumulator is that
+    /// its result is trustworthy, and a value it cannot represent must not be reported
+    /// as if it were.
+    #[error("numeric overflow: {0}")]
+    Overflow(Arc<str>),
 }
 
 impl Error {
@@ -76,6 +84,11 @@ impl Error {
     /// Builds an [`Error::Config`].
     pub fn config(reason: impl std::fmt::Display) -> Self {
         Error::Config(reason.to_string().into())
+    }
+
+    /// Builds an [`Error::Overflow`].
+    pub fn overflow(reason: impl std::fmt::Display) -> Self {
+        Error::Overflow(reason.to_string().into())
     }
 }
 

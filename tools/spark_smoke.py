@@ -148,6 +148,17 @@ def run(spark) -> None:
     assert joined_rows[(1, "alice")] == "NO"
     assert joined_rows[(3, "carol")] is None  # no country for id=3, left join keeps the row
 
+    # broadcast_join rejects "right"/"full" outright: unsound under per-partition
+    # broadcast (an unmatched small_table row would surface once per partition, not
+    # once overall). Checked before touching Spark, so no mapInArrow execution needed.
+    for how in ("right", "full"):
+        try:
+            wspark.broadcast_join(df, small, ["id"], ["id"], how=how)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"expected broadcast_join(how={how!r}) to raise ValueError")
+
     # schema helpers
     arrow_schema = wspark.to_arrow_schema(df)
     assert isinstance(arrow_schema, pa.Schema)
