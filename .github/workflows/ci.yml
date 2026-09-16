@@ -66,21 +66,11 @@ jobs:
       # Bakes the exact source commit this wheel was built from into the wheel
       # itself, as a plain Python constant (witchhat.__commit__), so a downloaded
       # wheel is traceable to a commit even detached from this workflow run's own
-      # metadata. See crates/witchhat-py/python/witchhat/_build_info.py for what
-      # this does and does not prove (not a full SBOM, not a signature).
+      # metadata. See crates/witchhat-py/python/witchhat/_build_info.py and
+      # tools/stamp_build_info.py for what this does and does not prove (not a
+      # full SBOM, not a signature).
       - name: Stamp build provenance
-        run: |
-          set -eux
-          cat > crates/witchhat-py/python/witchhat/_build_info.py <<EOF
-          """Provenance for this build; see this file's own docstring in source
-          control for what these constants do and do not prove. Overwritten by
-          CI's wheel job just before building; the source-controlled version
-          has both constants as None.
-          """
-
-          COMMIT: str | None = "${{ github.sha }}"
-          BUILT_AT: str | None = "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          EOF
+        run: python tools/stamp_build_info.py "${{ github.sha }}"
 
       # abi3 comes from the pyo3 feature pinned in witchhat-py/Cargo.toml, so one
       # wheel per architecture covers 3.10 and later.
