@@ -1,4 +1,9 @@
-"""Type stubs for the ``witchhat`` package."""
+"""Type stubs for the ``witchhat`` package.
+
+Every function below can be optionally instrumented: see ``witchhat.metrics`` (a
+plain, fully-annotated Python module, not part of this stub) for JSON latency and
+throughput logging, disabled by default.
+"""
 
 from typing import TYPE_CHECKING, Protocol
 

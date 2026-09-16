@@ -1,10 +1,10 @@
 # witchhat: API Reference
 
 **Document type** Interface specification
-**Status** Describes the surface as built: composite hashing, schema validation, JSON normalization, regex cleanup, output-equivalence testing, deduplication, join, aggregate, schema/CPU introspection, and the `witchhat.spark` Databricks/Spark integration layer.
+**Status** Describes the surface as built: composite hashing, schema validation, JSON normalization, regex cleanup, output-equivalence testing, deduplication, join, aggregate, schema/CPU introspection, the `witchhat.spark` Databricks/Spark integration layer, and optional JSON metric logging.
 **Audience** Anyone calling this library from Python or from Rust.
 **Companion documents** `architecture.md` for why the design is shaped this way, `operations.md` for building and deploying it.
-**Version** 1.4
+**Version** 1.5
 **Date** 2026-09-16
 
 ---
@@ -37,12 +37,16 @@
   - 6. `aggregate`
   - 7. `collect_as_record_batch`, `broadcast_join`
   - 8. `validate_schema`, `schema_fingerprint`
-- IV. Rust Surface
+- IV. Metric Logging (`witchhat.metrics`)
+  - 1. `enable`, `disable`, `is_enabled`
+  - 2. Event shape
+  - 3. `row_count`, `measure`
+- V. Rust Surface
   - 1. Entry points
   - 2. Version enums
   - 3. Module map
   - 4. Error type
-- V. Semantics Callers Must Know
+- VI. Semantics Callers Must Know
   - 1. Column order
   - 2. Null and float equality
   - 3. Version pinning
@@ -52,14 +56,15 @@
   - 7. `join` requires exact key-type matches
   - 8. `aggregate` is numeric-only beyond `Count`
   - 9. `witchhat.spark`'s `repartition=True` default
-- VI. Worked Examples
+- VII. Worked Examples
   - 1. Deduplicating rows
   - 2. Checking output against Spark
   - 3. Validating a batch before processing it
   - 4. Normalizing JSON, then cleaning a column
   - 5. Joining and aggregating
   - 6. A Databricks notebook pipeline with `witchhat.spark`
-  - 7. Calling from Rust
+  - 7. Measuring latency and throughput
+  - 8. Calling from Rust
 - References
 - Appendix A. Parameter quick reference
 
@@ -73,7 +78,8 @@
 - `<Table 2-6>` Fields and methods of `EquivalenceReport`
 - `<Table 2-7>` Aggregate functions accepted by `aggregate`
 - `<Table 3-1>` `witchhat.spark` functions
-- `<Table 4-1>` Public Rust modules
+- `<Table 4-1>` Fields common to every metric event
+- `<Table 5-1>` Public Rust modules
 - `<Table A-1>` Parameter quick reference
 
 ### List of Figures
@@ -437,7 +443,59 @@ wspark.schema_fingerprint(df, version="v1") -> int
 is a `DataFrame` or `StructType` rather than an already-`pyarrow.Schema`) via
 `to_arrow_schema` first.
 
-## IV. Rust Surface
+## IV. Metric Logging (`witchhat.metrics`)
+
+Optional JSON instrumentation for every function in Chapter II, applied automatically to
+every `witchhat.spark` call too (Chapter III), since those call straight into the same,
+instrumented functions. Disabled by default and free when disabled. See
+`architecture.md` Chapter XVII for the design.
+
+```python
+witchhat.metrics.enable(sink="stdout") -> None
+witchhat.metrics.disable() -> None
+witchhat.metrics.is_enabled() -> bool
+witchhat.metrics.row_count(obj) -> int | None
+witchhat.metrics.measure(function, **context) -> contextmanager
+```
+
+### 1. `enable`, `disable`, `is_enabled`
+
+`enable(sink="stdout")` turns on metric logging: every wrapped call in Chapter II (and
+transitively Chapter III) emits one JSON event to `sink` on completion, success or
+failure. `sink` is `"stdout"` (JSON lines, the default), a file path (`str`/`Path`,
+lines appended), or a callable receiving each event as a `dict` (the extension point for
+routing into a logger, a `pyspark.Accumulator`, or anything else). `disable()` turns it
+back off; `is_enabled()` reports the current state.
+
+### 2. Event shape
+
+<Table 4-1> Fields common to every metric event
+
+| Field | Type | Meaning |
+|---|---|---|
+| `function` | `str` | Which witchhat function was called |
+| `ts` | `str` | ISO 8601 UTC timestamp |
+| `status` | `str` | `"ok"` or `"error"` |
+| `duration_ms` | `float` | Wall-clock time of the call |
+| `error` | `str`, present only on failure | The exception's type and message, never its traceback |
+| `rows_in`, `rows_out` | `int \| None`, where applicable | Row counts of the primary input/output |
+| `rows_per_second` | `float`, present when `rows_in` is known | `rows_in` divided by `duration_ms` |
+
+Every function also adds its own schema-level parameters: `hash_rows` adds `columns` and
+`version`; `join` adds `left_keys`/`right_keys`/`how` and a second `rows_in_right`;
+`aggregate` adds `group_by` and `aggregation_count`; and so on. No event, from any
+function, ever includes a cell value or a row's contents.
+
+### 3. `row_count`, `measure`
+
+`row_count(obj)` is the same best-effort helper the wrapped functions use internally
+(`.num_rows` for a `RecordBatch`-like value, `len()` for an `Array`-like value, `None`
+otherwise); useful for building a custom sink that wants to compute its own derived
+fields. `measure(function, **context)` is the context manager every wrapped function is
+built on; call it directly to instrument your own code the same way, including calls
+into functions this module does not already wrap.
+
+## V. Rust Surface
 
 ### 1. Entry points
 
@@ -479,7 +537,7 @@ key matching use `arrow_row`, not `hash_batch` (`architecture.md` Chapter IX, Se
 
 ### 3. Module map
 
-<Table 4-1> Public Rust modules
+<Table 5-1> Public Rust modules
 
 | Module | Contents |
 |---|---|
@@ -504,7 +562,7 @@ result, not an `Error`. `normalize_json` returns `Result` only for a structural 
 (an unsupported target type in `schema`), never for a malformed row, which is counted in
 `NormalizeStats` instead.
 
-## V. Semantics Callers Must Know
+## VI. Semantics Callers Must Know
 
 ### 1. Column order
 
@@ -582,7 +640,7 @@ to skip a redundant shuffle. Do not pass it as a general "make this faster" swit
 so on an arbitrarily partitioned `DataFrame` silently produces a partial, wrong answer
 rather than an error.
 
-## VI. Worked Examples
+## VII. Worked Examples
 
 ### 1. Deduplicating rows
 
@@ -674,7 +732,26 @@ totals = wspark.aggregate(enriched, ["country"], [("amount", "sum", "total")])
 totals.write.saveAsTable("silver.totals_by_country")
 ```
 
-### 7. Calling from Rust
+### 7. Measuring latency and throughput
+
+```python
+witchhat.metrics.enable()  # JSON lines to stdout
+
+witchhat.hash_rows(batch, ["id", "email"])
+# {"columns":["id","email"],"version":"v1","function":"hash_rows","ts":"...",
+#  "status":"ok","rows_in":4,"rows_out":4,"duration_ms":0.15,"rows_per_second":26666.7}
+
+witchhat.metrics.disable()
+```
+
+Route events elsewhere instead of stdout by passing a sink:
+
+```python
+events = []
+witchhat.metrics.enable(sink=events.append)  # or sink="/path/to/log.jsonl"
+```
+
+### 8. Calling from Rust
 
 ```rust
 use witchhat_core::{HashVersion, hash_batch};

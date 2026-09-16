@@ -94,6 +94,7 @@ jobs:
         run: |
           python -m pip install pyarrow
           python tools/smoke.py
+          python tools/metrics_smoke.py
 
       - uses: actions/upload-artifact@v4
         with:

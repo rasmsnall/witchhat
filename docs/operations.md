@@ -4,7 +4,7 @@
 **Status** Partial by necessity: witchhat is a stateless transformation library today, with no write path, no job to schedule, and no storage of its own. This document covers what already applies (build, install, sizing) and defers what does not yet (Chapter VI).
 **Audience** Whoever builds the wheel and installs it on a Databricks workspace.
 **Companion documents** `architecture.md` for the design, `api.md` for the callable surface.
-**Version** 1.5
+**Version** 1.6
 **Date** 2026-09-16
 
 ---
@@ -33,6 +33,7 @@
   - 7. Join builds one index over the larger of its two inputs
   - 8. Aggregate's extra cost is one row-index vector per group
   - 9. `witchhat.spark`'s partition-coordinating functions buffer a whole partition
+  - 10. Metric logging is free when off, and one JSON encode per call when on
 - V. Failure Modes
   - 1. Exceptions and what they mean
   - 2. What cannot fail
@@ -242,6 +243,18 @@ assuming `spark.sql.execution.arrow.maxRecordsPerBatch` alone bounds memory here
 it would for a row-local `witchhat.spark` function. `repartition=True` (the default on
 both) adds a shuffle before this, the same cost `df.repartition(...)` always has.
 
+### 10. Metric logging is free when off, and one JSON encode per call when on
+
+`witchhat.metrics` (`architecture.md` Chapter XVII) checks one boolean per wrapped call
+when disabled (the default) and does nothing else: no timing call, no `dict`
+allocation, no I/O. Enabled, the added cost per call is one `time.perf_counter()` pair
+and, per event, one JSON encode plus whatever the configured sink itself costs (a
+`print` to stdout, an `open`+`write` for a file sink, or whatever a callable sink does).
+Enabling it in a distributed job means every partition's Python worker pays that cost
+independently; there is no coordination overhead beyond that, since there is no
+cross-task aggregation to coordinate (Chapter VI, Section 1's monitoring note, and
+`architecture.md` Chapter XVII, Section 4).
+
 ## V. Failure Modes
 
 ### 1. Exceptions and what they mean
@@ -281,7 +294,10 @@ absent here (`architecture.md` Chapter XVIII has the full backlog):
 
 - **Storage maintenance (VACUUM, retention).** witchhat writes nothing.
 - **Monitoring and alerting.** No long-running process to monitor; a witchhat call fails
-  or succeeds synchronously within the caller's own job.
+  or succeeds synchronously within the caller's own job. `witchhat.metrics`
+  (Chapter IV, Section 10) is a building block a caller's own monitoring could be built from
+  (latency, throughput, error events as JSON), not a monitoring system in itself: it
+  has no built-in alerting, dashboards, or cross-task aggregation.
 - **Change management for a schema drift policy.** No load semantics exist yet for
   witchhat to enforce one; `validate_schema`/`check_equivalence` are the building blocks
   a caller's own policy would be built from.

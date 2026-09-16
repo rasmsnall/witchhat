@@ -1,10 +1,10 @@
 # witchhat: Architecture
 
 **Document type** Technical architecture specification
-**Status** Eight kernels (composite hashing, schema validation, JSON normalization, regex cleanup, output-equivalence testing, deduplication, join, aggregate) are implemented end to end, behind both the Rust and the Python surface, plus a Spark/Databricks integration layer (Chapter XVI). Filter and project need no witchhat-specific kernel (Arrow's own compute kernels already cover them); see Chapter XIX for what remains.
+**Status** Eight kernels (composite hashing, schema validation, JSON normalization, regex cleanup, output-equivalence testing, deduplication, join, aggregate) are implemented end to end, behind both the Rust and the Python surface, plus a Spark/Databricks integration layer (Chapter XVI) and optional JSON metric logging (Chapter XVII). Filter and project need no witchhat-specific kernel (Arrow's own compute kernels already cover them); see Chapter XX for what remains.
 **Audience** Anyone integrating, operating, or extending this library. No prior context assumed.
 **Companion documents** `api.md` for the callable surface, `operations.md` for building and deploying it.
-**Version** 1.5
+**Version** 1.6
 **Date** 2026-09-16
 
 ---
@@ -68,12 +68,17 @@
   - 3. The `uint64` problem
   - 4. Why `df.schema.add(...)` is not used
   - 5. `broadcast_join`, not a shuffle join
-- XVII. Dependencies
-- XVIII. Assessment
+- XVII. Metric Logging
+  - 1. What it computes
+  - 2. Where the wrapping lives, and why it covers `witchhat.spark` for free
+  - 3. What is in an event, and what is deliberately never in one
+  - 4. Sinks, and what this module deliberately does not do
+- XVIII. Dependencies
+- XIX. Assessment
   - 1. Advantages
   - 2. Disadvantages
   - 3. Conditions under which this design is inappropriate
-- XIX. Status and What Comes Next
+- XX. Status and What Comes Next
 - References
 - Appendix A. Glossary
 
@@ -86,7 +91,7 @@
 - `<Table 6-1>` Built-in cleanup presets (`v1`)
 - `<Table 10-1>` Aggregate functions
 - `<Table 16-1>` `witchhat.spark` functions by correctness class
-- `<Table 17-1>` Direct dependencies
+- `<Table 18-1>` Direct dependencies
 - `<Table A-1>` Glossary of terms
 
 ### List of Figures
@@ -130,7 +135,7 @@ infrastructure for future SIMD kernels (Chapter XI).
 Explicitly not in scope, by design: filter (row selection by a boolean predicate) and
 project (column selection/reorder) already exist as Arrow compute kernels
 (`arrow_select::filter::filter_record_batch`, `RecordBatch::project`) with no
-witchhat-specific behaviour to add, so witchhat does not wrap them. See Chapter XIX and
+witchhat-specific behaviour to add, so witchhat does not wrap them. See Chapter XX and
 the repository's `README.md` for anything still genuinely open.
 
 Also not in scope, by design: witchhat is not a distributed engine. It targets
@@ -579,7 +584,7 @@ by its input size; none spawn threads, perform I/O, or hold a lock across a call
 PyO3 boundary (Chapter XV) does not release the GIL during a call, because every
 current operation is CPU-bound and short relative to the cost of a Python call itself.
 This is expected to change once a kernel is expensive enough that releasing the GIL for
-the duration becomes worth its own overhead; Chapter XIX tracks it as an open item.
+the duration becomes worth its own overhead; Chapter XX tracks it as an open item.
 
 ## XIII. Failure Model
 
@@ -734,9 +739,63 @@ and joined locally against each partition's batch with `witchhat.join`. A large-
 join is explicitly out of scope for this function; `DataFrame.join` remains the right
 tool for that, not something to route through a per-partition Python call.
 
-## XVII. Dependencies
+## XVII. Metric Logging
 
-<Table 17-1> Direct dependencies
+### 1. What it computes
+
+`witchhat.metrics` (`crates/witchhat-py/python/witchhat/metrics.py`, pure Python, no
+Rust) is optional, opt-in JSON instrumentation: function name, row counts, duration and
+derived throughput, for spotting which call in a pipeline is the bottleneck. Disabled by
+default (`witchhat.metrics.is_enabled()` starts `False`); every wrapped function checks
+that flag first and does nothing metrics-related when it is `False`, so the default,
+uninstrumented path pays no timing call, no allocation, and no I/O.
+
+### 2. Where the wrapping lives, and why it covers `witchhat.spark` for free
+
+Instrumentation wraps each data-processing function at the `witchhat` package boundary
+(`crates/witchhat-py/python/witchhat/__init__.py`), not inside `witchhat-core` or the
+PyO3 layer: `witchhat-core` stays I/O-free by design (Chapter XII), and wrapping in pure
+Python at the outermost boundary is the cheapest point to add a conditional check that
+must run on every call regardless of language boundary cost already paid elsewhere.
+
+`witchhat.spark`'s wrapper functions call the (now instrumented) `witchhat` package
+functions directly, not a second implementation (Chapter XVI, Section 1), so enabling
+metric logging instruments every `witchhat.spark` call too with no separate
+configuration. The granularity follows each Spark wrapper's own shape: a row-local
+function (`hash_rows`, `clean_with_preset`/`clean_with_rules`) emits one event per Arrow
+batch, since that is what it calls the kernel on; a partition-coordinating function
+(`drop_duplicates`, `aggregate`) emits one event per Spark partition, since that is the
+one call it makes after buffering (Chapter XVI, Section 2).
+
+### 3. What is in an event, and what is deliberately never in one
+
+Every event is a flat JSON object: `function`, `ts` (ISO 8601 UTC), `status`
+(`"ok"`/`"error"`), `duration_ms`, and function-specific fields such as `rows_in`/
+`rows_out`/`rows_per_second`, the column or key names passed in, and a `version`/`how`/
+`func` string where relevant. An exception is recorded as `status: "error"` and an
+`error` field holding only the exception's type and message, never its traceback: a
+traceback can quote argument values, which could include row-derived data by accident,
+and this module holds itself to the same "no row data, ever" standard the Security Model
+chapter (XIV) states for the kernels themselves. Nothing about *why* a call errored
+beyond the message is needed for spotting a bottleneck, which is this feature's actual
+purpose.
+
+### 4. Sinks, and what this module deliberately does not do
+
+`enable(sink=...)` accepts `"stdout"` (JSON lines, the default), a file path (JSON lines
+appended), or a callable receiving each event as a `dict`. The callable form is the
+extension point for anything beyond a single process: routing events into a
+`pyspark.Accumulator`, a logger, or a queue is the caller's own few lines of code against
+a plain `dict`, not something this module attempts to solve generically. Building
+automatic cross-executor aggregation (collecting every partition's events back to the
+driver without the caller wiring an accumulator themselves) was considered and
+deliberately not built: it would need to reach into `witchhat.spark`'s `mapInArrow`
+closures specifically, coupling a general-purpose logging module to one integration's
+internals, for a problem the callable sink already lets a caller solve in their own code.
+
+## XVIII. Dependencies
+
+<Table 18-1> Direct dependencies
 
 | Crate | Why |
 |---|---|
@@ -754,7 +813,7 @@ Pinned 2026-09 (probed via `cargo build`; crates.io index reachable): `arrow 56.
 `xxhash-rust 0.8.18`, `serde_json 1.0.151`, `regex 1.13.1`, `thiserror 2.0.20`,
 `pyo3 0.25.1`.
 
-## XVIII. Assessment
+## XIX. Assessment
 
 ### 1. Advantages
 
@@ -772,8 +831,11 @@ Pinned 2026-09 (probed via `cargo build`; crates.io index reachable): `arrow 56.
 - `witchhat.spark`'s partition-coordinating wrappers default to *correct*
   (repartition-by-key), not merely fast, and document precisely which of the two each
   function is (Chapter XVI, Table 16-1).
+- Metric logging is genuinely free when off (one boolean check, nothing else), applies
+  transitively to every `witchhat.spark` call with no separate configuration, and never
+  logs a traceback that could quote row-derived values (Chapter XVII, Section 3).
 - No `unsafe` in this crate's own code; the dependency surface is small and each
-  dependency's role is documented (Chapter XVII).
+  dependency's role is documented (Chapter XVIII).
 
 ### 2. Disadvantages
 
@@ -796,6 +858,9 @@ Pinned 2026-09 (probed via `cargo build`; crates.io index reachable): `arrow 56.
 - `witchhat.spark.broadcast_join` covers only the broadcast pattern; a large-large
   shuffle join has no witchhat-provided path and is left to `DataFrame.join` itself
   (Chapter XVI, Section 5).
+- Metric logging has no built-in cross-executor aggregation; a distributed job's events
+  land wherever each partition's task ran unless the caller supplies a sink that
+  collects them itself (Chapter XVII, Section 4).
 
 ### 3. Conditions under which this design is inappropriate
 
@@ -814,15 +879,17 @@ Pinned 2026-09 (probed via `cargo build`; crates.io index reachable): `arrow 56.
   `DataFrame.join`/`DataFrame.groupBy(...).agg(...)` directly rather than
   `witchhat.spark` (Chapter XVI).
 
-## XIX. Status and What Comes Next
+## XX. Status and What Comes Next
 
 Implemented and tested: composite row/table hashing (now covering Date/Time/Timestamp/
 Decimal in addition to the original numeric/string/binary set), schema fingerprinting
 and validation, JSON normalization, regex cleanup (ad hoc and presets),
 output-equivalence testing, deduplication, join (inner/left/right/full), aggregate
 (count/sum/mean/min/max), CPU feature detection, the Python binding boundary, a
-Databricks/Spark integration layer (`witchhat.spark`, Chapter XVI), the `abi3-py310`
-wheel build now cross-built for both `x86_64` and `aarch64` (Graviton) manylinux targets.
+Databricks/Spark integration layer (`witchhat.spark`, Chapter XVI), optional JSON metric
+logging (`witchhat.metrics`, Chapter XVII, instrumenting `witchhat.spark` transitively),
+the `abi3-py310` wheel build now cross-built for both `x86_64` and `aarch64` (Graviton)
+manylinux targets.
 
 Publishing to a package repository and verifying installation from a Unity Catalog
 Volume against a live workspace were both raised and then deliberately decided against
@@ -865,5 +932,6 @@ scratch.
 | Row format | `arrow_row`'s canonical, memcmp-comparable byte encoding of one or more columns; the basis for `join` and `aggregate`'s grouping; see Chapter IX, Section 2 |
 | Partition-coordinating | A `witchhat.spark` function whose correctness across a whole `DataFrame` needs related rows already in the same partition; see Chapter XVI, Sections 1-2 |
 | `broadcast_join` | Joins each partition against one small side already collected to the driver; not a distributed shuffle join; see Chapter XVI, Section 5 |
+| Sink (metrics) | Where `witchhat.metrics` sends each JSON event: stdout, a file, or a caller-supplied callable; see Chapter XVII, Section 4 |
 | abi3 | CPython's stable ABI; one compiled extension loads on every Python from the
 declared floor version onward |
