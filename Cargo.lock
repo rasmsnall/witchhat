@@ -996,6 +996,7 @@ name = "witchhat-core"
 version = "0.1.0"
 dependencies = [
  "arrow-array",
+ "arrow-row",
  "arrow-schema",
  "arrow-select",
  "regex",

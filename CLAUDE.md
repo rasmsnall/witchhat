@@ -1,10 +1,12 @@
 # witchhat
 
 Python library, implemented in Rust, of native data-transformation kernels aimed at
-Spark/Databricks workloads. Status: **six kernels implemented end to end** (composite
+Spark/Databricks workloads. Status: **eight kernels implemented end to end** (composite
 hashing, schema validation, JSON normalization, regex cleanup, output-equivalence
-testing, deduplication). Join and aggregate, the relational operations that would make
-"native transformations" a real Spark replacement, are not yet built.
+testing, deduplication, join, aggregate). Filter/project need no witchhat kernel (Arrow's
+own compute kernels already cover them). Remaining open items are broader `aggregate`
+type support, deeper JSON normalization, and two items blocked on the user (package-repo
+publishing, Databricks Volumes verification) — see "Open items" below.
 
 ## Goals / constraints (from the user, verbatim intent)
 
@@ -22,12 +24,13 @@ testing, deduplication). Join and aggregate, the relational operations that woul
   (JSON), `CleanupVersion` (named cleanup presets only, never a caller's own regex).
 - CPU feature detection with a portable fallback, and the stronger constraint that
   follows from it: a SIMD-accelerated path may change speed, never output. See
-  `crates/witchhat-core/src/cpu.rs` and `docs/architecture.md` Chapter IX.
+  `crates/witchhat-core/src/cpu.rs` and `docs/architecture.md` Chapter XI.
 - Wheels usable from Databricks Volumes or a package repository; reproducible builds.
 - Generic framework for: composite hashing, schema validation, JSON normalization,
-  regex-heavy cleanup, output-equivalence testing (all done), and native transformations
-  (deduplication done; join/aggregate open), with the eventual goal of replacing Spark
-  operations outright.
+  regex-heavy cleanup, output-equivalence testing, and native transformations
+  (deduplication, join, aggregate) — all done — with the eventual goal of replacing
+  Spark operations outright. Join/aggregate deliberately do *not* reuse `hash_batch`:
+  see "Layout" below.
 
 ## Pivot history
 
@@ -49,7 +52,9 @@ crates/witchhat-core/src/validate.rs   ValidateSchemaOptions, SchemaDiff, valida
 crates/witchhat-core/src/json.rs       NormalizeVersion, NormalizeStats, normalize_json
 crates/witchhat-core/src/clean.rs      CleanRule, CleanupVersion, apply_rules, preset, clean_with_preset
 crates/witchhat-core/src/equivalence.rs EquivalenceOptions, EquivalenceReport, check_equivalence
-crates/witchhat-core/src/dedup.rs      drop_duplicates (first native transformation)
+crates/witchhat-core/src/dedup.rs      drop_duplicates (built on hash_batch)
+crates/witchhat-core/src/join.rs       JoinType, join (built on arrow_row, not hash_batch)
+crates/witchhat-core/src/aggregate.rs  AggFunc, Aggregation, aggregate (built on arrow_row too)
 crates/witchhat-core/src/cpu.rs        CpuFeatures, features()
 crates/witchhat-core/src/error.rs      Error, Result
 crates/witchhat-py/src/lib.rs          crate docs + pyo3 module shell (_witchhat)
@@ -71,7 +76,7 @@ tools/smoke.py        round-trips a real pyarrow batch through the built wheel, 
 Two-crate split (`witchhat-core` has no PyO3 dependency; `witchhat-py` is a thin
 translation layer over it), unlike `rust-streamer-pgdb`'s single-crate layout. Deliberate
 here: a future Rust-only consumer links `witchhat-core` without pulling in `pyo3` at all.
-See `docs/architecture.md` Chapter XIII for the full rationale, including why
+See `docs/architecture.md` Chapter XV for the full rationale, including why
 `witchhat-py` pins `pyo3 = "=0.25.1"` exactly (arrow's `pyarrow` Cargo feature links
 `pyo3-ffi` and tolerates only one exact version across the dependency graph; bumping pyo3
 later needs arrow to catch up first, not just an edited version string) and why every
@@ -79,12 +84,20 @@ typed array crosses the PyO3 boundary via `ArrayData` (`u64_array_*`/`string_arr
 helpers in `python.rs`) since `PyArrowType<T>` isn't `Clone` and arrow's pyarrow bridge
 doesn't implement `ToPyArrow`/`FromPyArrow` for typed arrays directly.
 
+`join`/`aggregate` use `arrow_row::RowConverter` for key/group comparison, not
+`hash_batch`: a `u64` fingerprint collision is an acceptable, documented risk for
+`table_fingerprint`/`check_equivalence` (weaker evidence toward a yes/no a human or CI
+job interprets), but would silently produce *wrong data* in a join or a group-by, so
+those two kernels use `arrow_row`'s exact byte-comparable row format instead. See
+`docs/architecture.md` Chapter IX, Section 2.
+
 ## Dependency budget
 
 | Crate | Why |
 |---|---|
 | `arrow-array`, `arrow-schema` | The data model. `witchhat-core` depends on these only, no pyo3 |
-| `arrow-select` | `filter_record_batch`, underlying `drop_duplicates` |
+| `arrow-select` | `filter_record_batch`/`take`, underlying `drop_duplicates`, `join`, `aggregate` |
+| `arrow-row` | `RowConverter`, underlying `join`/`aggregate`'s exact key/group comparison |
 | `arrow-data` | `ArrayData`, the untyped array arrow's pyarrow bridge actually converts (witchhat-py only) |
 | `arrow` (feature `pyarrow`) | Zero-copy `RecordBatch`/`ArrayData` <-> pyarrow conversion (witchhat-py only) |
 | `xxhash-rust` (feature `xxh3`) | Per-value hash function underlying `hash_batch` |
@@ -122,7 +135,7 @@ Same standard as `rust-streamer-pgdb`, adopted 2026-09-16 at the user's request:
 
 | Document | Contents |
 |---|---|
-| `docs/architecture.md` | Data model, per-kernel design (Chapters III-VIII), versioning/CPU-feature discipline, concurrency/failure/security model, dependency budget, what's not built yet |
+| `docs/architecture.md` | Data model, per-kernel design (Chapters III-X), versioning/CPU-feature discipline, concurrency/failure/security model, dependency budget, what's not built yet |
 | `docs/api.md` | Python and Rust surface, parameter semantics, worked examples |
 | `docs/operations.md` | Building and installing the wheel, sizing per kernel, what's deferred because unbuilt vs. deferred pending access this environment lacks (Chapter VI) |
 
@@ -160,28 +173,46 @@ Resolved and shipped:
   `validate_schema` + `table_fingerprint` over a column order shared between both sides
   (so declared column order alone doesn't cause a false mismatch); `is_equivalent()` is
   deliberately stricter than `SchemaDiff::is_breaking()` (an extra column fails it).
-- Deduplication (`dedup.rs`): `drop_duplicates`, the first native transformation
-  (Spark's `dropDuplicates`), reusing `hash_batch` as the dedup key plus
-  `arrow_select::filter::filter_record_batch`. Filter/project were deliberately *not*
-  wrapped: Arrow's own kernels already do the job.
+- Deduplication (`dedup.rs`): `drop_duplicates`, reusing `hash_batch` as the dedup key
+  plus `arrow_select::filter::filter_record_batch`. Filter/project were deliberately
+  *not* wrapped: Arrow's own kernels already do the job.
+- Join (`join.rs`): `join` (inner/left/right/full), keyed via `arrow_row::RowConverter`
+  rather than `hash_batch` (correctness, not just speed: see "Layout" above). Colliding
+  right-side column names get suffixed `_right`; every output field is nullable.
+  Right/left key columns require an exact Arrow type match, no implicit coercion.
+- Aggregate (`aggregate.rs`): `aggregate` with `Count`/`Sum`/`Mean`/`Min`/`Max`, grouped
+  via the same `arrow_row` approach as `join`. `Min`/`Max` preserve the source column's
+  exact type (compare through `f64` to find the extreme row, then `take` its original
+  value); `Sum`/`Mean` accumulate through `f64` (documented precision caveat beyond
+  ±2^53). Empty `group_by` means whole-table aggregate; an empty batch in that case still
+  produces one row (`Count` 0, others null), not zero rows.
+- Widened `hash_batch`/`dedup`/`check_equivalence` type coverage: added `Date32/64`,
+  `Time32/64`, `Timestamp` (any unit/timezone), `Decimal128/256`. Parameterized types
+  fold their parameters (unit, timezone, precision, scale) into the hash's type key, not
+  just a tag byte, so e.g. `Timestamp(Microsecond, None)` and `Timestamp(Microsecond,
+  Some("UTC"))` hash differently at the same raw value — same naive-vs-UTC lesson
+  `rust-streamer-pgdb` learned the hard way, noted in its own `CLAUDE.md`.
 - `schema_fingerprint`, `witchhat_core::cpu::features()`.
 - The `witchhat-py` mixed maturin layout (`python/witchhat/`), type stubs, `py.typed`,
   full Python bindings for every kernel above (`SchemaDiff.retyped` and
   `EquivalenceReport.schema_diff` both return/nest real `pyarrow.DataType`/`SchemaDiff`
-  objects, not strings/dicts).
+  objects, not strings/dicts; `join`/`aggregate` take `how`/`func` as plain strings,
+  parsed via `JoinType::parse`/`AggFunc::parse` at the boundary).
 - The wheel builds (`maturin build --release`) and was verified against a real
   `pyarrow.RecordBatch` (`tools/smoke.py` exercises every exported function), not just
   the Rust unit tests.
 - Full rustdoc on every public `witchhat-core` item; `cargo doc --no-deps -D warnings`
-  and `cargo clippy --all-targets -- -D warnings` both clean. 49 Rust unit tests plus 12
+  and `cargo clippy --all-targets -- -D warnings` both clean. 68 Rust unit tests plus 14
   doctests, all passing.
 - `rust-toolchain.toml` pinned; CI and docs/CI conventions adopted from
   `rust-streamer-pgdb`.
 
 Still open:
 
-- Join and aggregate: the two relational operations that would make "native
-  transformations" a real Spark replacement rather than supporting infrastructure.
+- Broader `aggregate` type support: string min/max, `Decimal`/`Date`/`Time`/`Timestamp`
+  aggregation are unbuilt (`Sum`/`Mean`/`Min`/`Max` are numeric-only today).
+- Deeper JSON normalization: array-valued fields and more than one level of object
+  nesting are unbuilt (fall into the type-mismatch case in `normalize_json` today).
 - Publishing to a package repository. **Blocked on the user, not on more code**: needs a
   PyPI (or internal index) account and an upload credential this repository's automation
   does not hold. A package upload is one-way (cannot be un-published, only yanked), so
@@ -192,9 +223,9 @@ Still open:
   no Databricks workspace to test against. The `/Volumes/...` install procedure is
   documented in `docs/operations.md` Chapter III as the intended path, but unconfirmed.
 - Whether/when a kernel becomes expensive enough to justify releasing the GIL
-  (`docs/architecture.md` Chapter X); none does yet, though JSON normalization and regex
-  cleanup are the most CPU-intensive kernels so far per input byte (`docs/operations.md`
-  Chapter IV, Section 5).
+  (`docs/architecture.md` Chapter XII); none does yet, though JSON normalization and
+  regex cleanup are the most CPU-intensive kernels so far per input byte
+  (`docs/operations.md` Chapter IV, Section 5).
 
 ## Environment notes
 

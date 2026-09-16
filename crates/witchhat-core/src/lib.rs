@@ -14,7 +14,9 @@
 //! - [`json`]: parsing a column of JSON strings into a fixed Arrow schema.
 //! - [`clean`]: regex-based find-and-replace cleanup, ad hoc or from a named preset.
 //! - [`equivalence`]: checking a witchhat pipeline's output against a reference.
-//! - [`dedup`]: the first native transformation, deduplication.
+//! - [`dedup`]: deduplication, built on [`hash`].
+//! - [`mod@join`]: matching rows of two batches on key columns, built on [`arrow_row`].
+//! - [`mod@aggregate`]: grouping rows and reducing each group, also built on [`arrow_row`].
 //! - [`cpu`]: runtime CPU feature detection for future SIMD dispatch.
 //! - [`error`]: the crate's error type.
 
@@ -22,22 +24,26 @@
 #![warn(missing_docs)]
 #![warn(rustdoc::broken_intra_doc_links)]
 
+pub mod aggregate;
 pub mod clean;
 pub mod cpu;
 pub mod dedup;
 pub mod equivalence;
 pub mod error;
 pub mod hash;
+pub mod join;
 pub mod json;
 pub mod schema;
 pub mod validate;
 
+pub use aggregate::{AggFunc, Aggregation, aggregate};
 pub use clean::{CleanRule, CleanupVersion, apply_rules, clean_with_preset};
 pub use cpu::{CpuFeatures, features};
 pub use dedup::drop_duplicates;
 pub use equivalence::{EquivalenceOptions, EquivalenceReport, check_equivalence};
 pub use error::{Error, Result};
 pub use hash::{HashVersion, hash_batch, hash_batch_all_columns, table_fingerprint};
+pub use join::{JoinType, join};
 pub use json::{NormalizeStats, NormalizeVersion, normalize_json};
 pub use schema::{DataType, Field, Fields, Schema, SchemaRef, schema_fingerprint};
 pub use validate::{

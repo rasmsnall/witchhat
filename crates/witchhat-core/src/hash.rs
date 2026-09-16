@@ -14,11 +14,14 @@
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
-    Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type,
+    Date32Type, Date64Type, Decimal128Type, Decimal256Type, Float32Type, Float64Type, Int8Type,
+    Int16Type, Int32Type, Int64Type, Time32MillisecondType, Time32SecondType,
+    Time64MicrosecondType, Time64NanosecondType, TimestampMicrosecondType,
+    TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType, UInt8Type, UInt16Type,
     UInt32Type, UInt64Type,
 };
 use arrow_array::{Array, RecordBatch, UInt64Array};
-use arrow_schema::DataType;
+use arrow_schema::{DataType, TimeUnit};
 use xxhash_rust::xxh3::Xxh3;
 
 use crate::error::{Error, Result};
@@ -85,10 +88,14 @@ impl HashVersion {
     }
 }
 
-// type tags disambiguate values that could otherwise share a byte pattern:
-// an Int64 5 and a Float64 5.0 do not have the same bytes, but an Int32 5
-// and an Int64 5 both contain the byte sequence [5,0,0,0], so the tag (not
-// just the width) has to be part of what gets hashed.
+// type keys disambiguate values that could otherwise share a byte pattern: an Int64 5
+// and a Float64 5.0 do not have the same bytes, but an Int32 5 and an Int64 5 both
+// contain the byte sequence [5,0,0,0], so a fixed tag byte (not just the width) has to
+// be part of what gets hashed. Time32/Time64/Timestamp additionally fold their time
+// unit (and Timestamp its timezone) into the key, and Decimal128/256 their precision
+// and scale, since those are also part of what a raw integer means: a Time32(Second) 5
+// and a Time32(Millisecond) 5 are different instants, and a Decimal128(10,2) 500 and a
+// Decimal128(10,0) 500 are different numbers, despite identical underlying bytes.
 const TAG_NULL: u8 = 0x00;
 const TAG_BOOL: u8 = 0x01;
 const TAG_I8: u8 = 0x02;
@@ -103,18 +110,34 @@ const TAG_F32: u8 = 0x0A;
 const TAG_F64: u8 = 0x0B;
 const TAG_STR: u8 = 0x0C;
 const TAG_BIN: u8 = 0x0D;
+const TAG_DATE32: u8 = 0x0E;
+const TAG_DATE64: u8 = 0x0F;
+const TAG_TIME32: u8 = 0x10;
+const TAG_TIME64: u8 = 0x11;
+const TAG_TIMESTAMP: u8 = 0x12;
+const TAG_DECIMAL128: u8 = 0x13;
+const TAG_DECIMAL256: u8 = 0x14;
+
+fn time_unit_tag(unit: TimeUnit) -> u8 {
+    match unit {
+        TimeUnit::Second => 0,
+        TimeUnit::Millisecond => 1,
+        TimeUnit::Microsecond => 2,
+        TimeUnit::Nanosecond => 3,
+    }
+}
 
 #[inline]
-fn value_hash(version: HashVersion, tag: u8, bytes: &[u8]) -> u64 {
+fn value_hash(version: HashVersion, type_key: &[u8], bytes: &[u8]) -> u64 {
     let mut hasher = Xxh3::with_seed(version.seed());
-    hasher.update(&[tag]);
+    hasher.update(type_key);
     hasher.update(bytes);
     hasher.digest()
 }
 
 #[inline]
-fn null_hash(version: HashVersion, tag: u8) -> u64 {
-    value_hash(version, tag, &[TAG_NULL])
+fn null_hash(version: HashVersion, type_key: &[u8]) -> u64 {
+    value_hash(version, type_key, &[TAG_NULL])
 }
 
 /// Order-sensitive combiner (boost's `hash_combine`, widened to 64 bits):
@@ -129,13 +152,14 @@ fn combine(acc: u64, value: u64) -> u64 {
 }
 
 macro_rules! hash_primitive_column {
-    ($array:expr, $version:expr, $tag:expr, $acc:expr, $arrow_ty:ty) => {{
+    ($array:expr, $version:expr, $type_key:expr, $acc:expr, $arrow_ty:ty) => {{
         let a = $array.as_primitive::<$arrow_ty>();
+        let type_key: &[u8] = $type_key;
         for (i, slot) in $acc.iter_mut().enumerate() {
             let h = if a.is_null(i) {
-                null_hash($version, $tag)
+                null_hash($version, type_key)
             } else {
-                value_hash($version, $tag, &a.value(i).to_le_bytes())
+                value_hash($version, type_key, &a.value(i).to_le_bytes())
             };
             *slot = combine(*slot, h);
         }
@@ -168,30 +192,30 @@ fn hash_column_into(array: &dyn Array, version: HashVersion, acc: &mut [u64]) ->
             let a = array.as_boolean();
             for (i, slot) in acc.iter_mut().enumerate() {
                 let h = if a.is_null(i) {
-                    null_hash(version, TAG_BOOL)
+                    null_hash(version, &[TAG_BOOL])
                 } else {
-                    value_hash(version, TAG_BOOL, &[a.value(i) as u8])
+                    value_hash(version, &[TAG_BOOL], &[a.value(i) as u8])
                 };
                 *slot = combine(*slot, h);
             }
         }
-        DataType::Int8 => hash_primitive_column!(array, version, TAG_I8, acc, Int8Type),
-        DataType::Int16 => hash_primitive_column!(array, version, TAG_I16, acc, Int16Type),
-        DataType::Int32 => hash_primitive_column!(array, version, TAG_I32, acc, Int32Type),
-        DataType::Int64 => hash_primitive_column!(array, version, TAG_I64, acc, Int64Type),
-        DataType::UInt8 => hash_primitive_column!(array, version, TAG_U8, acc, UInt8Type),
-        DataType::UInt16 => hash_primitive_column!(array, version, TAG_U16, acc, UInt16Type),
-        DataType::UInt32 => hash_primitive_column!(array, version, TAG_U32, acc, UInt32Type),
-        DataType::UInt64 => hash_primitive_column!(array, version, TAG_U64, acc, UInt64Type),
+        DataType::Int8 => hash_primitive_column!(array, version, &[TAG_I8], acc, Int8Type),
+        DataType::Int16 => hash_primitive_column!(array, version, &[TAG_I16], acc, Int16Type),
+        DataType::Int32 => hash_primitive_column!(array, version, &[TAG_I32], acc, Int32Type),
+        DataType::Int64 => hash_primitive_column!(array, version, &[TAG_I64], acc, Int64Type),
+        DataType::UInt8 => hash_primitive_column!(array, version, &[TAG_U8], acc, UInt8Type),
+        DataType::UInt16 => hash_primitive_column!(array, version, &[TAG_U16], acc, UInt16Type),
+        DataType::UInt32 => hash_primitive_column!(array, version, &[TAG_U32], acc, UInt32Type),
+        DataType::UInt64 => hash_primitive_column!(array, version, &[TAG_U64], acc, UInt64Type),
         DataType::Float32 => {
             let a = array.as_primitive::<Float32Type>();
             for (i, slot) in acc.iter_mut().enumerate() {
                 let h = if a.is_null(i) {
-                    null_hash(version, TAG_F32)
+                    null_hash(version, &[TAG_F32])
                 } else {
                     value_hash(
                         version,
-                        TAG_F32,
+                        &[TAG_F32],
                         &canonicalize_f32(a.value(i)).to_le_bytes(),
                     )
                 };
@@ -202,11 +226,11 @@ fn hash_column_into(array: &dyn Array, version: HashVersion, acc: &mut [u64]) ->
             let a = array.as_primitive::<Float64Type>();
             for (i, slot) in acc.iter_mut().enumerate() {
                 let h = if a.is_null(i) {
-                    null_hash(version, TAG_F64)
+                    null_hash(version, &[TAG_F64])
                 } else {
                     value_hash(
                         version,
-                        TAG_F64,
+                        &[TAG_F64],
                         &canonicalize_f64(a.value(i)).to_le_bytes(),
                     )
                 };
@@ -217,9 +241,9 @@ fn hash_column_into(array: &dyn Array, version: HashVersion, acc: &mut [u64]) ->
             let a = array.as_string::<i32>();
             for (i, slot) in acc.iter_mut().enumerate() {
                 let h = if a.is_null(i) {
-                    null_hash(version, TAG_STR)
+                    null_hash(version, &[TAG_STR])
                 } else {
-                    value_hash(version, TAG_STR, a.value(i).as_bytes())
+                    value_hash(version, &[TAG_STR], a.value(i).as_bytes())
                 };
                 *slot = combine(*slot, h);
             }
@@ -228,9 +252,9 @@ fn hash_column_into(array: &dyn Array, version: HashVersion, acc: &mut [u64]) ->
             let a = array.as_string::<i64>();
             for (i, slot) in acc.iter_mut().enumerate() {
                 let h = if a.is_null(i) {
-                    null_hash(version, TAG_STR)
+                    null_hash(version, &[TAG_STR])
                 } else {
-                    value_hash(version, TAG_STR, a.value(i).as_bytes())
+                    value_hash(version, &[TAG_STR], a.value(i).as_bytes())
                 };
                 *slot = combine(*slot, h);
             }
@@ -239,9 +263,9 @@ fn hash_column_into(array: &dyn Array, version: HashVersion, acc: &mut [u64]) ->
             let a = array.as_binary::<i32>();
             for (i, slot) in acc.iter_mut().enumerate() {
                 let h = if a.is_null(i) {
-                    null_hash(version, TAG_BIN)
+                    null_hash(version, &[TAG_BIN])
                 } else {
-                    value_hash(version, TAG_BIN, a.value(i))
+                    value_hash(version, &[TAG_BIN], a.value(i))
                 };
                 *slot = combine(*slot, h);
             }
@@ -250,12 +274,70 @@ fn hash_column_into(array: &dyn Array, version: HashVersion, acc: &mut [u64]) ->
             let a = array.as_binary::<i64>();
             for (i, slot) in acc.iter_mut().enumerate() {
                 let h = if a.is_null(i) {
-                    null_hash(version, TAG_BIN)
+                    null_hash(version, &[TAG_BIN])
                 } else {
-                    value_hash(version, TAG_BIN, a.value(i))
+                    value_hash(version, &[TAG_BIN], a.value(i))
                 };
                 *slot = combine(*slot, h);
             }
+        }
+        DataType::Date32 => hash_primitive_column!(array, version, &[TAG_DATE32], acc, Date32Type),
+        DataType::Date64 => hash_primitive_column!(array, version, &[TAG_DATE64], acc, Date64Type),
+        DataType::Time32(unit) => {
+            let type_key = [TAG_TIME32, time_unit_tag(*unit)];
+            match unit {
+                TimeUnit::Second => {
+                    hash_primitive_column!(array, version, &type_key, acc, Time32SecondType)
+                }
+                TimeUnit::Millisecond => {
+                    hash_primitive_column!(array, version, &type_key, acc, Time32MillisecondType)
+                }
+                TimeUnit::Microsecond | TimeUnit::Nanosecond => {
+                    return Err(Error::unsupported_type(array.data_type().clone()));
+                }
+            }
+        }
+        DataType::Time64(unit) => {
+            let type_key = [TAG_TIME64, time_unit_tag(*unit)];
+            match unit {
+                TimeUnit::Microsecond => {
+                    hash_primitive_column!(array, version, &type_key, acc, Time64MicrosecondType)
+                }
+                TimeUnit::Nanosecond => {
+                    hash_primitive_column!(array, version, &type_key, acc, Time64NanosecondType)
+                }
+                TimeUnit::Second | TimeUnit::Millisecond => {
+                    return Err(Error::unsupported_type(array.data_type().clone()));
+                }
+            }
+        }
+        DataType::Timestamp(unit, tz) => {
+            let mut type_key = vec![TAG_TIMESTAMP, time_unit_tag(*unit)];
+            if let Some(tz) = tz {
+                type_key.extend_from_slice(tz.as_bytes());
+            }
+            match unit {
+                TimeUnit::Second => {
+                    hash_primitive_column!(array, version, &type_key, acc, TimestampSecondType)
+                }
+                TimeUnit::Millisecond => {
+                    hash_primitive_column!(array, version, &type_key, acc, TimestampMillisecondType)
+                }
+                TimeUnit::Microsecond => {
+                    hash_primitive_column!(array, version, &type_key, acc, TimestampMicrosecondType)
+                }
+                TimeUnit::Nanosecond => {
+                    hash_primitive_column!(array, version, &type_key, acc, TimestampNanosecondType)
+                }
+            }
+        }
+        DataType::Decimal128(precision, scale) => {
+            let type_key = [TAG_DECIMAL128, *precision, *scale as u8];
+            hash_primitive_column!(array, version, &type_key, acc, Decimal128Type)
+        }
+        DataType::Decimal256(precision, scale) => {
+            let type_key = [TAG_DECIMAL256, *precision, *scale as u8];
+            hash_primitive_column!(array, version, &type_key, acc, Decimal256Type)
         }
         other => return Err(Error::unsupported_type(other.clone())),
     }
@@ -285,10 +367,24 @@ fn resolve_indices(batch: &RecordBatch, columns: &[&str]) -> Result<Vec<usize>> 
 /// rather than bitwise identity.
 ///
 /// Supported Arrow types: `Boolean`, `Int8`..`Int64`, `UInt8`..`UInt64`, `Float32`,
-/// `Float64`, `Utf8`, `LargeUtf8`, `Binary`, `LargeBinary`. A column of any other type
-/// returns [`Error::UnsupportedType`], even if it is not one of the requested `columns`
-/// (every returned index is validated before hashing starts, and every listed column is
+/// `Float64`, `Utf8`, `LargeUtf8`, `Binary`, `LargeBinary`, `Date32`, `Date64`,
+/// `Time32(Second|Millisecond)`, `Time64(Microsecond|Nanosecond)`, `Timestamp` (any
+/// unit, with or without a timezone), `Decimal128`, `Decimal256`. A column of any other
+/// type (`List`, `Struct`, `Dictionary`, and the two invalid `Time32`/`Time64` unit
+/// combinations Arrow's own type system does not prevent at the type level) returns
+/// [`Error::UnsupportedType`], even if it is not one of the requested `columns` (every
+/// returned index is validated before hashing starts, and every listed column is
 /// hashed).
+///
+/// `Time32`/`Time64`/`Timestamp` fold their time unit, and `Timestamp` additionally its
+/// timezone, into what gets hashed alongside the tag: a `Time32(Second)` value of `5`
+/// and a `Time32(Millisecond)` value of `5` are different instants and hash
+/// differently, and a naive `Timestamp` and one carrying an explicit `"UTC"` hash
+/// differently even at the same raw value, matching how the two are not
+/// interchangeable (see `rust-streamer-pgdb`'s own naive-vs-UTC timestamp lesson).
+/// `Decimal128`/`Decimal256` fold in their precision and scale the same way, so a
+/// `Decimal128(10, 2)` and a `Decimal128(10, 0)` holding the same raw unscaled integer
+/// hash differently, since they represent different numbers.
 ///
 /// # Errors
 ///
@@ -484,6 +580,127 @@ mod tests {
     fn unknown_column_errors() {
         let b = batch();
         assert!(hash_batch(&b, &["missing"], HashVersion::CURRENT).is_err());
+    }
+
+    #[test]
+    fn timestamp_units_do_not_collide() {
+        use arrow_array::TimestampSecondArray;
+        use arrow_array::types::TimestampMillisecondType;
+
+        let seconds_schema = Arc::new(Schema::new(vec![Field::new(
+            "t",
+            DataType::Timestamp(TimeUnit::Second, None),
+            false,
+        )]));
+        let seconds = RecordBatch::try_new(
+            seconds_schema,
+            vec![Arc::new(TimestampSecondArray::from(vec![5]))],
+        )
+        .unwrap();
+
+        let millis_schema = Arc::new(Schema::new(vec![Field::new(
+            "t",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        )]));
+        let millis = RecordBatch::try_new(
+            millis_schema,
+            vec![Arc::new(arrow_array::PrimitiveArray::<
+                TimestampMillisecondType,
+            >::from(vec![5]))],
+        )
+        .unwrap();
+
+        let hs = hash_batch(&seconds, &["t"], HashVersion::CURRENT).unwrap();
+        let hm = hash_batch(&millis, &["t"], HashVersion::CURRENT).unwrap();
+        assert_ne!(hs.value(0), hm.value(0));
+    }
+
+    #[test]
+    fn timestamp_timezone_changes_the_hash() {
+        use arrow_array::TimestampMicrosecondArray;
+
+        let naive_schema = Arc::new(Schema::new(vec![Field::new(
+            "t",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        )]));
+        let naive = RecordBatch::try_new(
+            naive_schema,
+            vec![Arc::new(TimestampMicrosecondArray::from(vec![5]))],
+        )
+        .unwrap();
+
+        let utc_schema = Arc::new(Schema::new(vec![Field::new(
+            "t",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        )]));
+        let utc = RecordBatch::try_new(
+            utc_schema,
+            vec![Arc::new(
+                TimestampMicrosecondArray::from(vec![5]).with_timezone("UTC"),
+            )],
+        )
+        .unwrap();
+
+        let hn = hash_batch(&naive, &["t"], HashVersion::CURRENT).unwrap();
+        let hu = hash_batch(&utc, &["t"], HashVersion::CURRENT).unwrap();
+        assert_ne!(hn.value(0), hu.value(0));
+    }
+
+    #[test]
+    fn decimal_scale_changes_the_hash() {
+        use arrow_array::Decimal128Array;
+
+        let a = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "v",
+                DataType::Decimal128(10, 2),
+                false,
+            )])),
+            vec![Arc::new(
+                Decimal128Array::from(vec![500])
+                    .with_precision_and_scale(10, 2)
+                    .unwrap(),
+            )],
+        )
+        .unwrap();
+        let b = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "v",
+                DataType::Decimal128(10, 0),
+                false,
+            )])),
+            vec![Arc::new(
+                Decimal128Array::from(vec![500])
+                    .with_precision_and_scale(10, 0)
+                    .unwrap(),
+            )],
+        )
+        .unwrap();
+
+        let ha = hash_batch(&a, &["v"], HashVersion::CURRENT).unwrap();
+        let hb = hash_batch(&b, &["v"], HashVersion::CURRENT).unwrap();
+        assert_ne!(ha.value(0), hb.value(0));
+    }
+
+    #[test]
+    fn date32_does_not_collide_with_int32() {
+        let date_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Date32, false)])),
+            vec![Arc::new(arrow_array::Date32Array::from(vec![5]))],
+        )
+        .unwrap();
+        let int_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)])),
+            vec![Arc::new(Int32Array::from(vec![5]))],
+        )
+        .unwrap();
+
+        let hd = hash_batch(&date_batch, &["v"], HashVersion::CURRENT).unwrap();
+        let hi = hash_batch(&int_batch, &["v"], HashVersion::CURRENT).unwrap();
+        assert_ne!(hd.value(0), hi.value(0));
     }
 
     #[test]

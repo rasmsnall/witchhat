@@ -119,6 +119,36 @@ def main() -> int:
     deduped = witchhat.drop_duplicates(dup_batch, ["id"])
     assert deduped.column("id").to_pylist() == [1, 2, 3]
 
+    users = pa.record_batch(
+        {
+            "id": pa.array([1, 2, 3], type=pa.int64()),
+            "name": pa.array(["alice", "bob", "carol"]),
+        }
+    )
+    orders = pa.record_batch(
+        {
+            "user_id": pa.array([1, 1, 4], type=pa.int64()),
+            "item": pa.array(["book", "pen", "ghost"]),
+        }
+    )
+    inner = witchhat.join(users, orders, ["id"], ["user_id"], how="inner")
+    assert inner.num_rows == 2
+    left = witchhat.join(users, orders, ["id"], ["user_id"], how="left")
+    assert left.num_rows == 4  # alice x2, bob x null, carol x null
+    full = witchhat.join(users, orders, ["id"], ["user_id"], how="full")
+    assert full.num_rows == 5  # + the unmatched "ghost" order
+
+    sales = pa.record_batch(
+        {
+            "country": pa.array(["NO", "SE", "NO"]),
+            "amount": pa.array([10, 20, 5], type=pa.int64()),
+        }
+    )
+    totals = witchhat.aggregate(sales, ["country"], [("amount", "sum", "total")])
+    assert totals.num_rows == 2
+    by_country = dict(zip(totals.column("country").to_pylist(), totals.column("total").to_pylist()))
+    assert by_country["NO"] == 15.0
+
     print("OK")
     return 0
 

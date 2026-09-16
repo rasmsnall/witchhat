@@ -4,7 +4,7 @@
 **Status** Partial by necessity: witchhat is a stateless transformation library today, with no write path, no job to schedule, and no storage of its own. This document covers what already applies (build, install, sizing) and defers what does not yet (Chapter VI).
 **Audience** Whoever builds the wheel and installs it on a Databricks workspace.
 **Companion documents** `architecture.md` for the design, `api.md` for the callable surface.
-**Version** 1.2
+**Version** 1.3
 **Date** 2026-09-16
 
 ---
@@ -30,6 +30,8 @@
   - 4. Schema validation is a different shape
   - 5. JSON normalization and regex cleanup cost more per row than hashing
   - 6. Deduplication's extra cost is one `HashSet<u64>`
+  - 7. Join builds one index over the larger of its two inputs
+  - 8. Aggregate's extra cost is one row-index vector per group
 - V. Failure Modes
   - 1. Exceptions and what they mean
   - 2. What cannot fail
@@ -165,7 +167,7 @@ Every kernel runs on the calling thread; nothing here uses multiple cores yet. O
 Databricks driver or worker, parallelism today comes from calling witchhat once per Spark
 partition (e.g. from a `mapInArrow`/Pandas UDF), not from anything internal to the
 library. A future kernel expensive enough to justify releasing the GIL (`architecture.md`
-Chapter X) would also be a candidate for internal parallelism; neither exists yet.
+Chapter XII) would also be a candidate for internal parallelism; neither exists yet.
 
 ### 4. Schema validation is a different shape
 
@@ -191,6 +193,22 @@ practical, rather than chaining many small ones, if this becomes a measured bott
 sized to at most `batch.num_rows()` entries to track which hashes have already been
 seen. No second pass over the data beyond the `filter_record_batch` call that builds the
 output.
+
+### 7. Join builds one index over the larger of its two inputs
+
+`join` builds one hash index (keyed by `arrow_row`'s byte-comparable row format) over
+`right`'s key rows, `O(right.num_rows())` extra memory, then probes it once per `left`
+row. Pass the larger side as `right` if the two are very different sizes; the current
+implementation does not choose automatically.
+
+### 8. Aggregate's extra cost is one row-index vector per group
+
+`aggregate` builds the same `arrow_row` structures as `join` for `group_by`, plus one
+`Vec<u32>` of row indices per distinct group (`O(batch.num_rows())` total across all
+groups) to know which rows belong to which output row. `Sum`/`Mean`/`Min`/`Max` then
+each make one additional pass over every group's row indices per aggregation requested,
+so an `aggregate` call with many aggregation columns costs proportionally more, not just
+proportionally to `batch.num_rows()`.
 
 ## V. Failure Modes
 
@@ -227,7 +245,7 @@ they need something only a human with the right access can provide.
 ### 1. Deferred because the feature does not exist yet
 
 The following sections exist in a conventional operations manual and are deliberately
-absent here (`architecture.md` Chapter XVI has the full backlog):
+absent here (`architecture.md` Chapter XVIII has the full backlog):
 
 - **Storage maintenance (VACUUM, retention).** witchhat writes nothing.
 - **Monitoring and alerting.** No long-running process to monitor; a witchhat call fails
@@ -238,7 +256,7 @@ absent here (`architecture.md` Chapter XVI has the full backlog):
 - **Re-run/recovery procedure.** Every call is a pure function of its input; there is no
   partial state to recover from.
 
-Revisit as each corresponding backlog item in `architecture.md` Chapter XVI lands.
+Revisit as each corresponding backlog item in `architecture.md` Chapter XVIII lands.
 
 ### 2. Deferred pending access this environment does not have
 

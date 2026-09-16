@@ -422,6 +422,95 @@ def drop_duplicates(
         Arrow type has no defined hash.
     """
 
+def join(
+    left: _ArrowArrayExportable,
+    right: _ArrowArrayExportable,
+    left_keys: list[str],
+    right_keys: list[str],
+    how: str = "inner",
+) -> "pa.RecordBatch":
+    """Join ``left`` and ``right`` on ``left_keys``/``right_keys``, matched pairwise
+    by position (``left_keys[0]`` compares against ``right_keys[0]``, and so on).
+
+    The output schema is every field of ``left`` followed by every field of
+    ``right``; a ``right`` field whose name collides with a ``left`` field is
+    suffixed ``_right``. Every output field is nullable regardless of the input
+    schemas' own nullability, since an outer join can introduce a null on either
+    side.
+
+    Row order: every ``left`` row in its original order, each repeated once per
+    match (or once with null ``right`` columns, under ``"left"``/``"full"``, if it
+    has none), followed by every unmatched ``right`` row in its original order,
+    under ``"right"``/``"full"``.
+
+    Parameters
+    ----------
+    left, right:
+        The two batches to join.
+    left_keys, right_keys:
+        Column names, matched pairwise: ``left_keys[i]``'s Arrow type must exactly
+        equal ``right_keys[i]``'s. Must be the same non-empty length.
+    how:
+        ``"inner"`` (only rows with a match on both sides), ``"left"`` (every
+        ``left`` row), ``"right"`` (every ``right`` row), or ``"full"`` (every row
+        of both).
+
+    Returns
+    -------
+    pyarrow.RecordBatch
+
+    Raises
+    ------
+    ValueError
+        ``how`` is not one of the four recognised join types.
+    RuntimeError
+        A name in ``left_keys``/``right_keys`` is not in its batch's schema, or
+        ``left_keys[i]``'s type does not exactly match ``right_keys[i]``'s.
+    """
+
+def aggregate(
+    batch: _ArrowArrayExportable,
+    group_by: list[str],
+    aggregations: list[tuple[str, str, str]],
+) -> "pa.RecordBatch":
+    """Group ``batch`` by ``group_by`` and reduce each group with ``aggregations``.
+
+    ``group_by`` may be empty, in which case every row of ``batch`` is one group (a
+    whole-table aggregate); an empty ``batch`` in that case still produces exactly
+    one output row, with ``"count"`` ``0`` and every other aggregation ``None``.
+    Output row order is first-seen group order, not sorted.
+
+    The output schema is ``group_by``'s columns (types preserved from ``batch``,
+    always nullable), followed by one column per ``aggregations`` entry, named by
+    its alias, in the order given.
+
+    Parameters
+    ----------
+    batch:
+        The batch to aggregate.
+    group_by:
+        Column names to group by.
+    aggregations:
+        ``(column, func, alias)`` triples. ``func`` is ``"count"`` (non-null values,
+        any column type, output ``int64``), ``"sum"``/``"mean"`` (numeric columns
+        only, output ``float64``, ``None`` if every value in the group is null), or
+        ``"min"``/``"max"`` (numeric columns only, output type matches the input
+        column, ``None`` if every value in the group is null).
+
+    Returns
+    -------
+    pyarrow.RecordBatch
+
+    Raises
+    ------
+    ValueError
+        A ``func`` is not one of the five recognised aggregate functions.
+    RuntimeError
+        A name in ``group_by`` or an aggregation's ``column`` is not in ``batch``'s
+        schema, or a ``sum``/``mean``/``min``/``max`` column is not numeric
+        (``int8``..``int64``, ``uint8``..``uint64``, ``float32``, ``float64``).
+    """
+
 def cpu_features() -> CpuFeatures:
     """Detect the CPU features of the machine running this process.
 

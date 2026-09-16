@@ -3,8 +3,9 @@
 A high-performance data-transformation library for Spark and Databricks
 workloads: a Rust core exposed to Python via PyO3, aimed at replacing
 Spark-native operations (hashing, schema validation, JSON normalization,
-regex-heavy cleanup) with something an order of magnitude faster on a single
-node, while staying byte-for-byte comparable to Spark's output.
+regex-heavy cleanup, join, aggregate) with something an order of magnitude
+faster on a single node, while staying byte-for-byte comparable to Spark's
+output.
 
 ## Documentation
 
@@ -64,8 +65,10 @@ witchhat.clean_with_rules(batch.column("phone"), [(r"[^0-9]", "")])
 report = witchhat.check_equivalence(witchhat_batch, spark_batch)
 assert report.is_equivalent()
 
-# the first native transformation: dropDuplicates, built on hash_rows
+# native transformations: dropDuplicates, join, and group-by aggregation
 witchhat.drop_duplicates(batch, ["id", "email"])
+joined = witchhat.join(users, orders, ["id"], ["user_id"], how="left")
+witchhat.aggregate(joined, ["country"], [("amount", "sum", "total")])
 ```
 
 `batch` can be anything that implements the Arrow C Data / pyarrow interface
@@ -92,7 +95,10 @@ falls out for free.
 exact algorithm (type tags, null handling, float canonicalization, the
 combiner) behind a name (`"v1"`). A future improvement ships as `"v2"`
 instead of silently changing what `"v1"` produces, so a fingerprint computed
-today is still reproducible next year. See
+today is still reproducible next year. Covers booleans, all integer widths,
+floats, strings, binary, `Date32/64`, `Time32/64`, `Timestamp` (any
+unit/timezone), and `Decimal128/256` — a `Timestamp` with an explicit `"UTC"`
+hashes differently from a naive one, even at the same raw value. See
 [`crates/witchhat-core/src/hash.rs`](crates/witchhat-core/src/hash.rs).
 
 **CPU features change speed, never output.** [`witchhat_core::cpu`] detects
@@ -135,34 +141,46 @@ column fails equivalence even though it wouldn't fail schema validation. See
 [`crates/witchhat-core/src/equivalence.rs`](crates/witchhat-core/src/equivalence.rs).
 
 **Deduplication builds on hashing instead of reinventing row comparison.**
-[`drop_duplicates`] is the first native transformation, equivalent to
-Spark's `dropDuplicates`: one pass with `hash_batch` as the dedup key.
+[`drop_duplicates`] is a native transformation equivalent to Spark's
+`dropDuplicates`: one pass with `hash_batch` as the dedup key.
 Filter and project were left to Arrow's own compute kernels, which already
 do the job with nothing witchhat-specific to add. See
 [`crates/witchhat-core/src/dedup.rs`](crates/witchhat-core/src/dedup.rs).
 
+**Join and aggregate use exact comparison, not a fingerprint.** A join or a
+group-by boundary is a correctness question, not a "probably the same"
+one, so [`join`] and [`aggregate`] key rows through
+[`arrow_row::RowConverter`](https://docs.rs/arrow-row) instead of
+`hash_batch`: two rows compare equal only when they truly are, not when
+their `u64` fingerprints happen to collide. [`aggregate`]'s `Min`/`Max`
+additionally preserve the source column's exact type rather than losing it
+to the `f64` comparison used only to find the extreme value. See
+[`crates/witchhat-core/src/join.rs`](crates/witchhat-core/src/join.rs) and
+[`crates/witchhat-core/src/aggregate.rs`](crates/witchhat-core/src/aggregate.rs).
+
 ## Not built yet
 
 Composite hashing, schema validation, JSON normalization, regex cleanup,
-output-equivalence testing, and deduplication are done. Ordered by what the
-stated goal needs next:
+output-equivalence testing, deduplication, join, and aggregate are done.
+What's left:
 
-1. **Join and aggregate.** The two relational operations still needed for
-   "native transformations" to be a real Spark replacement. Filter and
-   project already exist as Arrow compute kernels with nothing
-   witchhat-specific to add.
-2. **Reproducible-build check.** manylinux abi3 wheel build + CI are done (see
+1. **Reproducible-build check.** manylinux abi3 wheel build + CI are done (see
    `.github/workflows/ci.yml`); still need a same-inputs -> byte-identical-wheel check.
-3. **Publish to a package repository.** Needs a PyPI (or internal index)
+2. **Publish to a package repository.** Needs a PyPI (or internal index)
    account and an upload credential this repository's automation does not
    hold; a package upload is one-way, so this is left to a human running it
    deliberately rather than attempted by default. See `docs/operations.md`
    Chapter VI, Section 2 for what's needed before this can happen.
-4. **Databricks Volumes distribution — verify, not just document.** The
+3. **Databricks Volumes distribution — verify, not just document.** The
    `/Volumes/...` install path is written up in `docs/operations.md`
    Chapter III, but has not been run against a real Databricks workspace;
    this development environment has none. See `docs/operations.md`
    Chapter VI, Section 2.
+4. **Broader `aggregate` type support.** `Sum`/`Mean`/`Min`/`Max` are numeric-only
+   today (no string min/max, no `Decimal`/`Date`/`Time`/`Timestamp` aggregation).
+5. **Deeper JSON normalization.** `normalize_json` supports one level of
+   nested-object flattening; array-valued fields and deeper nesting are not
+   yet handled.
 
 Type hints and generated docs (`.pyi` stubs, `py.typed`, `docs/*.md` + generated
 `.docx`) are done; see the Documentation section above.
@@ -173,14 +191,18 @@ Type hints and generated docs (`.pyi` stubs, `py.typed`, `docs/*.md` + generated
 cargo test --workspace
 ```
 
-49 unit tests plus 12 doctests, all in `witchhat-core`, covering: hash determinism,
-column-order sensitivity, null-vs-value distinctness, type-tag collision avoidance,
-float canonicalization; schema-diff correctness (missing/unexpected/retyped/nullability,
+68 unit tests plus 14 doctests, all in `witchhat-core`, covering: hash determinism,
+column-order sensitivity, null-vs-value distinctness, type-tag collision avoidance
+(including the Date/Time/Timestamp/Decimal types added alongside join/aggregate), float
+canonicalization; schema-diff correctness (missing/unexpected/retyped/nullability,
 numeric widening opt-in); JSON normalization (malformed rows, type mismatches, absent
 vs. explicit-null, nested-path extraction); regex cleanup (every built-in preset, rule
 ordering, invalid-pattern rejection); output equivalence (identical, reordered,
 different-value, different-row-count, column-order-independent, explicit-column-subset
-batches); and deduplication (first-occurrence order, composite keys, unknown columns).
+batches); deduplication (first-occurrence order, composite keys, unknown columns); join
+(inner/left/right/full, composite keys, name-collision suffixing, key-type mismatch);
+and aggregate (sum/count/min/max per group, type preservation, whole-table and
+empty-batch aggregation, unsupported-type rejection).
 `cargo doc --no-deps -p witchhat-core` and `cargo clippy --workspace --all-targets`
 both run clean with warnings denied (`missing_docs`, `broken_intra_doc_links`, clippy's
 default lint set); see `.github/workflows/ci.yml`.

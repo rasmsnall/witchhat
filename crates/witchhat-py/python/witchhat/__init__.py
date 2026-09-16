@@ -22,8 +22,9 @@ Output equivalence testing: :func:`check_equivalence` compares two batches (sche
 count, and an order-independent fingerprint of their rows) and returns an
 :class:`EquivalenceReport`.
 
-Native transformations: :func:`drop_duplicates` is the first one, equivalent to Spark's
-``dropDuplicates``.
+Native transformations: :func:`drop_duplicates` (equivalent to Spark's
+``dropDuplicates``), :func:`join` (inner/left/right/full, matched on key columns), and
+:func:`aggregate` (group by columns, reduce with count/sum/mean/min/max).
 
 :func:`cpu_features` reports what SIMD dispatch this machine would get from a future
 accelerated kernel.
@@ -37,6 +38,7 @@ from ._witchhat import (
     EquivalenceReport,
     NormalizeStats,
     SchemaDiff,
+    aggregate,
     check_equivalence,
     clean_with_preset,
     clean_with_rules,
@@ -44,6 +46,7 @@ from ._witchhat import (
     drop_duplicates,
     hash_rows,
     hash_rows_all_columns,
+    join,
     normalize_json,
     schema_fingerprint,
     table_fingerprint,
@@ -64,6 +67,8 @@ __all__ = [
     "check_equivalence",
     "EquivalenceReport",
     "drop_duplicates",
+    "join",
+    "aggregate",
     "cpu_features",
     "CpuFeatures",
 ]

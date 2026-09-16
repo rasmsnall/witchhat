@@ -1,10 +1,10 @@
 # witchhat: API Reference
 
 **Document type** Interface specification
-**Status** Describes the surface as built: composite hashing, schema validation, JSON normalization, regex cleanup, output-equivalence testing, deduplication, and schema/CPU introspection.
+**Status** Describes the surface as built: composite hashing, schema validation, JSON normalization, regex cleanup, output-equivalence testing, deduplication, join, aggregate, and schema/CPU introspection.
 **Audience** Anyone calling this library from Python or from Rust.
 **Companion documents** `architecture.md` for why the design is shaped this way, `operations.md` for building and deploying it.
-**Version** 1.2
+**Version** 1.3
 **Date** 2026-09-16
 
 ---
@@ -25,7 +25,9 @@
   - 8. `clean_with_preset` and `clean_with_rules`
   - 9. `check_equivalence` and `EquivalenceReport`
   - 10. `drop_duplicates`
-  - 11. `cpu_features` and `CpuFeatures`
+  - 11. `join`
+  - 12. `aggregate`
+  - 13. `cpu_features` and `CpuFeatures`
 - III. Rust Surface
   - 1. Entry points
   - 2. Version enums
@@ -38,12 +40,15 @@
   - 4. What accepts non-pyarrow objects
   - 5. `validate_schema` argument order
   - 6. `check_equivalence` is stricter than "not breaking"
+  - 7. `join` requires exact key-type matches
+  - 8. `aggregate` is numeric-only beyond `Count`
 - V. Worked Examples
   - 1. Deduplicating rows
   - 2. Checking output against Spark
   - 3. Validating a batch before processing it
   - 4. Normalizing JSON, then cleaning a column
-  - 5. Calling from Rust
+  - 5. Joining and aggregating
+  - 6. Calling from Rust
 - References
 - Appendix A. Parameter quick reference
 
@@ -55,6 +60,7 @@
 - `<Table 2-4>` Fields of `NormalizeStats`
 - `<Table 2-5>` Built-in cleanup presets
 - `<Table 2-6>` Fields and methods of `EquivalenceReport`
+- `<Table 2-7>` Aggregate functions accepted by `aggregate`
 - `<Table 3-1>` Public Rust modules
 - `<Table A-1>` Parameter quick reference
 
@@ -121,8 +127,8 @@ version ("v1")               -+
 
 | Exception | Raised when |
 |---|---|
-| `ValueError` | `version` does not name a known algorithm, or a preset `name` is unrecognised |
-| `RuntimeError` | A name in `columns` is not in `batch`'s schema, or a column's Arrow type has no defined hash/kernel |
+| `ValueError` | `version` does not name a known algorithm, a preset `name` is unrecognised, or a `how`/`func` string (`join`/`aggregate`) is unrecognised |
+| `RuntimeError` | A name in `columns` is not in `batch`'s schema, a column's Arrow type has no defined hash/kernel, or `join`'s key types mismatch |
 
 `validate_schema` and `normalize_json` are the exceptions to the `RuntimeError` row: a
 schema mismatch and a malformed JSON row are both normal, representable results, not
@@ -253,14 +259,55 @@ Keeps the first row of every distinct value of `columns`, dropping the rest, pre
 the relative order of the rows that remain. Equivalent to Spark's
 `df.dropDuplicates(subset=columns)`. Same exceptions as `hash_rows`.
 
-### 11. `cpu_features` and `CpuFeatures`
+### 11. `join`
+
+```python
+witchhat.join(left, right, left_keys, right_keys, how="inner") -> pyarrow.RecordBatch
+```
+
+Joins `left` and `right` on `left_keys`/`right_keys`, matched pairwise by position.
+`how` is `"inner"`, `"left"`, `"right"` or `"full"`. The output schema is every field of
+`left` followed by every field of `right`, with a `right` name collision suffixed
+`_right`, and every field nullable (an outer join can null either side). See
+`architecture.md` Chapter IX for the full design, including why key comparison uses
+`arrow_row` rather than `hash_batch`.
+
+Raises `ValueError` for an unrecognised `how`; `RuntimeError` for an unknown column, or
+`left_keys[i]`'s type not exactly matching `right_keys[i]`'s (see Section 7 below).
+
+### 12. `aggregate`
+
+```python
+witchhat.aggregate(batch, group_by, aggregations) -> pyarrow.RecordBatch
+```
+
+Groups `batch` by `group_by` and reduces each group with `aggregations`, a list of
+`(column, func, alias)` triples. `group_by` may be empty (whole-table aggregate). See
+`architecture.md` Chapter X for grouping semantics and why `Min`/`Max` preserve the
+source type while `Sum`/`Mean` accumulate through `f64`.
+
+<Table 2-7> Aggregate functions accepted by `aggregate`
+
+| `func` | Input types | Output | Null handling |
+|---|---|---|---|
+| `"count"` | any | `int64` | Counts non-null values |
+| `"sum"` | numeric | `float64` | `None` if the group is all-null |
+| `"mean"` / `"avg"` | numeric | `float64` | `None` if the group is all-null |
+| `"min"` | numeric | matches input | `None` if the group is all-null |
+| `"max"` | numeric | matches input | `None` if the group is all-null |
+
+"numeric" here is `int8`..`int64`, `uint8`..`uint64`, `float32`, `float64` (see
+Section 8 below). Raises `ValueError` for an unrecognised `func`; `RuntimeError` for an
+unknown column, or a non-numeric column passed to anything but `"count"`.
+
+### 13. `cpu_features` and `CpuFeatures`
 
 ```python
 witchhat.cpu_features() -> witchhat.CpuFeatures
 ```
 
 Returns a `CpuFeatures` instance with boolean properties `sse42`, `avx2`, `avx512f`,
-`neon`. See `architecture.md` Chapter IX for why this exists and what it does (and does
+`neon`. See `architecture.md` Chapter XI for why this exists and what it does (and does
 not yet) affect.
 
 ## III. Rust Surface
@@ -278,10 +325,12 @@ witchhat_core::apply_rules(input: &StringArray, rules: &[CleanRule]) -> StringAr
 witchhat_core::clean_with_preset(input: &StringArray, name: &str, version: CleanupVersion) -> Result<StringArray>
 witchhat_core::check_equivalence(actual: &RecordBatch, expected: &RecordBatch, options: EquivalenceOptions) -> Result<EquivalenceReport>
 witchhat_core::drop_duplicates(batch: &RecordBatch, columns: &[&str], version: HashVersion) -> Result<RecordBatch>
+witchhat_core::join(left: &RecordBatch, right: &RecordBatch, left_keys: &[&str], right_keys: &[&str], how: JoinType) -> Result<RecordBatch>
+witchhat_core::aggregate(batch: &RecordBatch, group_by: &[&str], aggregations: &[Aggregation]) -> Result<RecordBatch>
 witchhat_core::features() -> CpuFeatures
 ```
 
-All synchronous, none perform I/O; see `architecture.md` Chapter X for the concurrency
+All synchronous, none perform I/O; see `architecture.md` Chapter XII for the concurrency
 model. Full rustdoc, including examples, is on every item (`cargo doc --no-deps -p
 witchhat-core`).
 
@@ -289,13 +338,17 @@ witchhat-core`).
 
 ```rust
 pub enum HashVersion { V1 }          // hash_batch, table_fingerprint, schema_fingerprint,
-                                      // check_equivalence, drop_duplicates
+                                      // check_equivalence, drop_duplicates, join, aggregate*
 pub enum NormalizeVersion { V1 }     // normalize_json
 pub enum CleanupVersion { V1 }       // preset, clean_with_preset
 ```
 
 Each has `CURRENT`, `as_str(self) -> &'static str`, `parse(s: &str) -> Option<Self>`, and
-implements `Default` (returning `CURRENT`).
+implements `Default` (returning `CURRENT`). `JoinType` and `AggFunc` are plain mode
+enums, not versioned algorithms (`architecture.md` Chapter III, Section 2 explains why);
+each still has a `parse(s: &str) -> Option<Self>` for the Python boundary's string
+arguments. *`aggregate` and `join` do not take a `HashVersion` themselves; grouping and
+key matching use `arrow_row`, not `hash_batch` (`architecture.md` Chapter IX, Section 2).
 
 ### 3. Module map
 
@@ -310,6 +363,8 @@ implements `Default` (returning `CURRENT`).
 | `witchhat_core::clean` | `CleanRule`, `CleanupVersion`, `apply_rules`, `preset`, `clean_with_preset` |
 | `witchhat_core::equivalence` | `EquivalenceOptions`, `EquivalenceReport`, `check_equivalence` |
 | `witchhat_core::dedup` | `drop_duplicates` |
+| `witchhat_core::join` | `JoinType`, `join` |
+| `witchhat_core::aggregate` | `AggFunc`, `Aggregation`, `aggregate` |
 | `witchhat_core::cpu` | `CpuFeatures`, `features` |
 | `witchhat_core::error` | `Error`, `Result` |
 
@@ -317,7 +372,7 @@ implements `Default` (returning `CURRENT`).
 
 `witchhat_core::Error` (`thiserror`-derived, `Clone`, `'static`): `UnknownColumn`,
 `TypeMismatch`, `SchemaMismatch`, `UnsupportedType`, `Config`. See `architecture.md`
-Chapter XI. `validate_schema` does not return `Result`: an unequal schema is a normal
+Chapter XIII. `validate_schema` does not return `Result`: an unequal schema is a normal
 result, not an `Error`. `normalize_json` returns `Result` only for a structural problem
 (an unsupported target type in `schema`), never for a malformed row, which is counted in
 `NormalizeStats` instead.
@@ -343,9 +398,10 @@ Pass `version` explicitly (rather than relying on the `"v1"` default) anywhere a
 is stored and compared against a value computed by a different call site or a later
 release. This applies to `hash_rows`/`table_fingerprint`/`schema_fingerprint`/
 `check_equivalence`/`drop_duplicates` (`HashVersion`), `normalize_json`
-(`NormalizeVersion`), and `clean_with_preset` (`CleanupVersion`). `validate_schema` and
-`clean_with_rules` have no version parameter: the former is a structural check, the
-latter uses the caller's own rules, neither of which witchhat's own versioning applies to.
+(`NormalizeVersion`), and `clean_with_preset` (`CleanupVersion`). `validate_schema`,
+`clean_with_rules`, `join` and `aggregate` have no version parameter: the first two are
+a structural check and the caller's own rules respectively, and the latter two use
+`arrow_row`'s exact comparison rather than a witchhat-defined algorithm.
 
 ### 4. What accepts non-pyarrow objects
 
@@ -370,6 +426,23 @@ just non-breaking: an `actual` with one extra column fails `is_equivalent()` eve
 that same diff would pass `SchemaDiff.is_breaking() == False` on its own. Use
 `validate_schema` directly if "no breaking change" rather than "identical" is the
 question being asked.
+
+### 7. `join` requires exact key-type matches
+
+`left_keys[i]`'s Arrow type must exactly equal `right_keys[i]`'s; there is no implicit
+coercion (`int32` joined against `int64` raises `RuntimeError`, even though
+`validate_schema` would accept that pairing as a widening under
+`allow_numeric_widening=True`). Cast one side to match the other first if the types
+should be treated as comparable.
+
+### 8. `aggregate` is numeric-only beyond `Count`
+
+`"sum"`/`"mean"`/`"min"`/`"max"` only accept `int8`..`int64`, `uint8`..`uint64`,
+`float32`, `float64` columns; a `Decimal`/`Date`/`Time`/`Timestamp`/`Utf8` column raises
+`RuntimeError` for any of those four (`"count"` accepts any column type). `"sum"`/
+`"mean"` accumulate through `f64`, so an `int64`/`uint64` column with values beyond
+`f64`'s exact-integer range (±2^53) can lose precision in the result; `"min"`/`"max"`
+are unaffected, since they return the original, untouched value from the source column.
 
 ## V. Worked Examples
 
@@ -423,7 +496,24 @@ if stats.rows_malformed:
 cleaned_note = witchhat.clean_with_preset(batch.column("note"), "collapse_whitespace")
 ```
 
-### 5. Calling from Rust
+### 5. Joining and aggregating
+
+```python
+users = pa.record_batch({
+    "id": pa.array([1, 2, 3]),
+    "country": pa.array(["NO", "SE", "NO"]),
+})
+orders = pa.record_batch({
+    "user_id": pa.array([1, 1, 2]),
+    "amount": pa.array([10, 5, 20]),
+})
+
+joined = witchhat.join(users, orders, ["id"], ["user_id"], how="inner")
+totals = witchhat.aggregate(joined, ["country"], [("amount", "sum", "total")])
+# totals: NO -> 15.0, SE -> 20.0
+```
+
+### 6. Calling from Rust
 
 ```rust
 use witchhat_core::{HashVersion, hash_batch};
@@ -452,4 +542,6 @@ let hashes = hash_batch(&batch, &["id", "email"], HashVersion::CURRENT)?;
 | `clean_with_rules` | `input`, `rules` | (none) |
 | `check_equivalence` | `actual`, `expected` | `columns=None`, `allow_numeric_widening=False`, `hash_version="v1"` |
 | `drop_duplicates` | `batch`, `columns` | `version="v1"` |
+| `join` | `left`, `right`, `left_keys`, `right_keys` | `how="inner"` |
+| `aggregate` | `batch`, `group_by`, `aggregations` | (none) |
 | `cpu_features` | (none) | (none) |

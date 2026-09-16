@@ -430,6 +430,67 @@ fn drop_duplicates(
     Ok(PyArrowType(deduped))
 }
 
+fn parse_join_type(how: &str) -> PyResult<witchhat_core::JoinType> {
+    witchhat_core::JoinType::parse(how)
+        .ok_or_else(|| PyValueError::new_err(format!("unknown join type {how:?}")))
+}
+
+/// Joins `left` and `right` on `left_keys`/`right_keys`, matched pairwise by position.
+/// `how` is `"inner"`, `"left"`, `"right"` or `"full"`. See `witchhat.join`'s docstring
+/// for the output schema (column-name collisions, nullability) and row order.
+/// Raises `ValueError` for an unrecognised `how`, `RuntimeError` for an unknown column
+/// or a key-type mismatch between `left_keys[i]` and `right_keys[i]`.
+#[pyfunction]
+#[pyo3(signature = (left, right, left_keys, right_keys, how = "inner"))]
+fn join(
+    left: PyArrowType<RecordBatch>,
+    right: PyArrowType<RecordBatch>,
+    left_keys: Vec<String>,
+    right_keys: Vec<String>,
+    how: &str,
+) -> PyResult<PyArrowType<RecordBatch>> {
+    let how = parse_join_type(how)?;
+    let left_names: Vec<&str> = left_keys.iter().map(String::as_str).collect();
+    let right_names: Vec<&str> = right_keys.iter().map(String::as_str).collect();
+    let out = witchhat_core::join(&left.0, &right.0, &left_names, &right_names, how)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    Ok(PyArrowType(out))
+}
+
+fn parse_agg_func(func: &str) -> PyResult<witchhat_core::AggFunc> {
+    witchhat_core::AggFunc::parse(func)
+        .ok_or_else(|| PyValueError::new_err(format!("unknown aggregate function {func:?}")))
+}
+
+/// Groups `batch` by `group_by` and reduces each group with `aggregations`, a list of
+/// `(column, func, alias)` triples where `func` is `"count"`, `"sum"`, `"mean"`
+/// (or `"avg"`), `"min"` or `"max"`. See `witchhat.aggregate`'s docstring for the
+/// output schema, row order, and the empty-`group_by` (whole-table aggregate) case.
+/// Raises `ValueError` for an unrecognised `func`, `RuntimeError` for an unknown
+/// column or an unsupported column type for `sum`/`mean`/`min`/`max`.
+#[pyfunction]
+#[pyo3(signature = (batch, group_by, aggregations))]
+fn aggregate(
+    batch: PyArrowType<RecordBatch>,
+    group_by: Vec<String>,
+    aggregations: Vec<(String, String, String)>,
+) -> PyResult<PyArrowType<RecordBatch>> {
+    let group_names: Vec<&str> = group_by.iter().map(String::as_str).collect();
+    let aggs: Vec<witchhat_core::Aggregation> = aggregations
+        .into_iter()
+        .map(|(column, func, alias)| {
+            Ok(witchhat_core::Aggregation::new(
+                column,
+                parse_agg_func(&func)?,
+                alias,
+            ))
+        })
+        .collect::<PyResult<_>>()?;
+    let out = witchhat_core::aggregate(&batch.0, &group_names, &aggs)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    Ok(PyArrowType(out))
+}
+
 /// CPU features detected on the machine running this process.
 ///
 /// Informational only: nothing in this release branches on it. It exists so a future
@@ -490,6 +551,8 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(clean_with_rules, module)?)?;
     module.add_function(wrap_pyfunction!(check_equivalence, module)?)?;
     module.add_function(wrap_pyfunction!(drop_duplicates, module)?)?;
+    module.add_function(wrap_pyfunction!(join, module)?)?;
+    module.add_function(wrap_pyfunction!(aggregate, module)?)?;
     module.add_function(wrap_pyfunction!(cpu_features, module)?)?;
     Ok(())
 }
