@@ -110,19 +110,22 @@ jobs:
       # SHA256 checksums, so a downloaded wheel's integrity can be verified against
       # what this workflow run actually produced. Not a substitute for a signature
       # (nothing attests these checksums themselves), but a real, checkable link
-      # this project did not have before (docs/architecture.md Chapter XIX).
+      # this project did not have before (docs/architecture.md Chapter XIX). Written
+      # to the workspace root, not inside crates/witchhat-py/dist/: maturin-action's
+      # manylinux build runs in a Docker container as root, so dist/ itself ends up
+      # root-owned on the host afterward and a later step running as the normal
+      # runner user can read the wheel there but not create a new file inside it.
       - name: Checksum the wheel
         run: |
           set -eux
-          cd crates/witchhat-py/dist
-          sha256sum *.whl | tee SHA256SUMS
+          sha256sum crates/witchhat-py/dist/*.whl | tee SHA256SUMS
 
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-manylinux-${{ matrix.arch }}
           path: |
             crates/witchhat-py/dist/*.whl
-            crates/witchhat-py/dist/SHA256SUMS
+            SHA256SUMS
           if-no-files-found: error
 
   interpreters:
