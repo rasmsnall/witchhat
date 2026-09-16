@@ -25,9 +25,17 @@ matching `.docx` for each, following the same convention as the companion projec
 | `witchhat-core` | data model and native transformations. Arrow-backed, no Python dependency |
 | `witchhat-py` | PyO3 module (`witchhat._witchhat`), abi3 for Python >= 3.10, mixed layout under `python/witchhat/` |
 
+`crates/witchhat-py/python/witchhat/spark.py` is pure Python (no Rust, no compiled
+extension): the Databricks/Spark integration layer, calling the compiled functions above
+from `pyspark.sql.DataFrame.mapInArrow`. Lazily imports pyspark, so it never affects
+`import witchhat` outside Databricks.
+
 `rust-toolchain.toml` pins the Rust toolchain (rustc/rustfmt/clippy) so CI and a
 developer's machine agree. `tools/smoke.py` round-trips a real pyarrow batch through the
-built wheel; `.github/workflows/ci.yml` runs it as part of the manylinux wheel build.
+built wheel; `tools/spark_smoke.py` does the same for `witchhat.spark` against a real
+local Spark session (not in CI; pyspark is large and optional).
+`.github/workflows/ci.yml` builds and verifies `x86_64` and `aarch64` (Graviton) wheels
+on native runners of each.
 
 ## Quick start, Python
 
@@ -69,6 +77,17 @@ assert report.is_equivalent()
 witchhat.drop_duplicates(batch, ["id", "email"])
 joined = witchhat.join(users, orders, ["id"], ["user_id"], how="left")
 witchhat.aggregate(joined, ["country"], [("amount", "sum", "total")])
+```
+
+Or against a real Spark DataFrame in a Databricks notebook, via `witchhat.spark`:
+
+```python
+from witchhat import spark as wspark
+
+events = spark.table("bronze.events")
+tagged = wspark.hash_rows(events, ["user_id", "event_time"])
+deduped = wspark.drop_duplicates(tagged, ["user_id", "event_hash"])  # repartitions by default, for correctness
+totals = wspark.aggregate(deduped, ["country"], [("amount", "sum", "total")])
 ```
 
 `batch` can be anything that implements the Arrow C Data / pyarrow interface
@@ -158,19 +177,36 @@ to the `f64` comparison used only to find the extreme value. See
 [`crates/witchhat-core/src/join.rs`](crates/witchhat-core/src/join.rs) and
 [`crates/witchhat-core/src/aggregate.rs`](crates/witchhat-core/src/aggregate.rs).
 
+**`witchhat.spark` defaults to correct, not just fast.** The
+[`drop_duplicates`](crates/witchhat-py/python/witchhat/spark.py)/`aggregate`
+Spark wrappers repartition by the relevant columns before calling the
+underlying kernel unless told not to — `mapInArrow` hands them one Spark
+partition at a time with no visibility across partitions, so that default is
+what makes the result correct for the whole DataFrame, not merely a
+convenience. `broadcast_join` mirrors Spark's own broadcast-join
+optimization rather than attempting a distributed shuffle join, which
+witchhat (not a distributed engine) cannot do; see
+[`crates/witchhat-py/python/witchhat/spark.py`](crates/witchhat-py/python/witchhat/spark.py).
+
 ## Not built yet
 
 Composite hashing, schema validation, JSON normalization, regex cleanup,
-output-equivalence testing, deduplication, join, and aggregate are done.
-What's left:
+output-equivalence testing, deduplication, join, aggregate, and a
+Databricks/Spark integration layer (`witchhat.spark`) are done. What's left:
 
-1. **Reproducible-build check.** manylinux abi3 wheel build + CI are done (see
-   `.github/workflows/ci.yml`); still need a same-inputs -> byte-identical-wheel check.
+1. **Reproducible-build check.** manylinux abi3 wheels build + CI for both
+   `x86_64` and `aarch64` (Graviton) (see `.github/workflows/ci.yml`); still
+   need a same-inputs -> byte-identical-wheel check.
 2. **Broader `aggregate` type support.** `Sum`/`Mean`/`Min`/`Max` are numeric-only
    today (no string min/max, no `Decimal`/`Date`/`Time`/`Timestamp` aggregation).
 3. **Deeper JSON normalization.** `normalize_json` supports one level of
    nested-object flattening; array-valued fields and deeper nesting are not
    yet handled.
+4. **A distributed shuffle join through witchhat.** `witchhat.spark.broadcast_join`
+   only covers the broadcast pattern (a small side collected to the driver);
+   a large-large join has no witchhat-provided path and is left to Spark's own
+   `DataFrame.join`, deliberately (see `docs/architecture.md` Chapter XVI,
+   Section 5).
 
 Package-repository publishing and live Databricks Volumes verification were
 raised and deliberately decided against (2026-09-16): the project stays

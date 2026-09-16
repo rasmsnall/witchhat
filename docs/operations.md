@@ -4,7 +4,7 @@
 **Status** Partial by necessity: witchhat is a stateless transformation library today, with no write path, no job to schedule, and no storage of its own. This document covers what already applies (build, install, sizing) and defers what does not yet (Chapter VI).
 **Audience** Whoever builds the wheel and installs it on a Databricks workspace.
 **Companion documents** `architecture.md` for the design, `api.md` for the callable surface.
-**Version** 1.4
+**Version** 1.5
 **Date** 2026-09-16
 
 ---
@@ -18,6 +18,7 @@
   - 1. Prerequisites
   - 2. Build command
   - 3. Verifying the wheel
+  - 4. Testing `witchhat.spark` locally
 - III. Installing on Databricks
   - 1. From a Unity Catalog Volume
   - 2. From a package repository
@@ -31,6 +32,7 @@
   - 6. Deduplication's extra cost is one `HashSet<u64>`
   - 7. Join builds one index over the larger of its two inputs
   - 8. Aggregate's extra cost is one row-index vector per group
+  - 9. `witchhat.spark`'s partition-coordinating functions buffer a whole partition
 - V. Failure Modes
   - 1. Exceptions and what they mean
   - 2. What cannot fail
@@ -83,22 +85,42 @@ cd crates/witchhat-py
 maturin build --release
 ```
 
-Produces `target/wheels/witchhat-<version>-cp310-abi3-<platform>.whl`. For a manylinux
-wheel suitable for a Databricks Linux cluster, built from any host via Docker:
+Produces `target/wheels/witchhat-<version>-cp310-abi3-<platform>.whl` for the host's own
+architecture. For a manylinux wheel suitable for a Databricks Linux cluster, built from
+any host via Docker:
 
 ```
 maturin build --release --target x86_64-unknown-linux-gnu --manylinux 2_28 --zig
+maturin build --release --target aarch64-unknown-linux-gnu --manylinux 2_28 --zig
 ```
 
-(or run inside the `ghcr.io/pyo3/maturin` manylinux container; see
-`.github/workflows/ci.yml` for the exact invocation CI uses, via `PyO3/maturin-action`).
+(or run inside the `ghcr.io/pyo3/maturin` manylinux container). CI builds and verifies
+both architectures on native runners of each (`ubuntu-latest` for `x86_64`,
+`ubuntu-24.04-arm` for `aarch64`, not cross-compiled and assumed to work); see
+`.github/workflows/ci.yml`'s `wheel` job matrix for the exact invocation. The `aarch64`
+build is for Graviton (AWS ARM) Databricks clusters, which Databricks supports alongside
+`x86_64`.
 
 ### 3. Verifying the wheel
 
 The filename must contain `cp310-abi3`, not `cp310-cp310`: that is the difference
 between "loads on 3.10 and every later interpreter from one build" and "loads on 3.10
-only". CI's `wheel` job asserts this and then imports the wheel and exercises every
-exported function (`tools/smoke.py`) before publishing it as an artifact.
+only". It must also carry the correct architecture tag (`x86_64`/`aarch64`) for the
+matrix entry that built it. CI's `wheel` job asserts both and then imports the wheel and
+exercises every exported function (`tools/smoke.py`) on the native runner that built
+it, before publishing it as an artifact.
+
+### 4. Testing `witchhat.spark` locally
+
+`tools/spark_smoke.py` round-trips every `witchhat.spark` function against a real, local
+`pyspark` session (not part of CI: pyspark is a large, optional dependency, matching why
+`witchhat.spark` lazily imports it rather than requiring it). On a JDK 17+ machine, local
+Spark's bundled Arrow Java library can fail with `UnsupportedOperationException:
+sun.misc.Unsafe ... not available` on *any* Arrow-based Python UDF, before witchhat ever
+runs; this is a known pyspark/JDK compatibility gap, not a witchhat bug, does not affect
+Databricks (which manages its own JDK and Arrow versions), and `tools/spark_smoke.py`
+detects and explains it rather than failing with a bare Java stack trace. See the script's
+own module docstring for the JVM flags that resolve it on an affected machine.
 
 ## III. Installing on Databricks
 
@@ -117,6 +139,8 @@ inside a notebook:
 
 ```python
 %pip install /Volumes/<catalog>/<schema>/<volume>/witchhat-0.1.0-cp310-abi3-manylinux_2_28_x86_64.whl
+# or, on a Graviton (ARM) cluster:
+%pip install /Volumes/<catalog>/<schema>/<volume>/witchhat-0.1.0-cp310-abi3-manylinux_2_28_aarch64.whl
 ```
 
 This is the standard Databricks pattern for installing a wheel from a Volume path, not
@@ -140,7 +164,8 @@ distributed via Section 1 instead. See Chapter VI, Section 2 for the decision.
 The `abi3-py310` build loads on every CPython from 3.10 onward, which covers every
 Databricks Runtime in current use as of this document's date. A manylinux 2_28 wheel
 requires a correspondingly recent glibc on the cluster's base image, which every current
-DBR image satisfies.
+DBR image satisfies, on both `x86_64` and `aarch64` (Graviton) clusters — install the
+wheel matching the cluster's architecture; the two are not interchangeable.
 
 ## IV. Sizing
 
@@ -205,6 +230,17 @@ groups) to know which rows belong to which output row. `Sum`/`Mean`/`Min`/`Max` 
 each make one additional pass over every group's row indices per aggregation requested,
 so an `aggregate` call with many aggregation columns costs proportionally more, not just
 proportionally to `batch.num_rows()`.
+
+### 9. `witchhat.spark`'s partition-coordinating functions buffer a whole partition
+
+`witchhat.spark.drop_duplicates`/`aggregate` (`architecture.md` Chapter XVI, Section 2)
+materialize every `RecordBatch` `mapInArrow` hands them for one partition into a single
+batch (`pyarrow.concat_batches`) before calling the underlying kernel, so peak memory per
+task is one partition's worth of data, not one Arrow batch's worth. Size Spark's
+partition count accordingly (more, smaller partitions if memory is tight) rather than
+assuming `spark.sql.execution.arrow.maxRecordsPerBatch` alone bounds memory here, the way
+it would for a row-local `witchhat.spark` function. `repartition=True` (the default on
+both) adds a shuffle before this, the same cost `df.repartition(...)` always has.
 
 ## V. Failure Modes
 

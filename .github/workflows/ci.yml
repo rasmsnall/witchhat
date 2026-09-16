@@ -39,8 +39,23 @@ jobs:
           RUSTDOCFLAGS: -D warnings
 
   wheel:
-    name: manylinux abi3 wheel
-    runs-on: ubuntu-latest
+    name: manylinux abi3 wheel (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # x86_64 covers every Databricks cluster today; aarch64 covers Graviton
+        # (AWS) clusters, which Databricks also supports. Both build on a native
+        # runner of that architecture (ubuntu-24.04-arm is a real ARM64 machine, not
+        # QEMU), so "Round-trip" below actually executes the wheel it just built,
+        # not just cross-compiles it.
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+            target: x86_64
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64
     steps:
       - uses: actions/checkout@v4
 
@@ -48,13 +63,13 @@ jobs:
         with:
           python-version: "3.10"
 
-      # abi3 comes from the pyo3 feature pinned in witchhat-py/Cargo.toml, so one wheel
-      # covers 3.10 and later.
+      # abi3 comes from the pyo3 feature pinned in witchhat-py/Cargo.toml, so one
+      # wheel per architecture covers 3.10 and later.
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
           working-directory: crates/witchhat-py
-          target: x86_64
+          target: ${{ matrix.target }}
           manylinux: "2_28"
           args: --release --out dist
 
@@ -65,6 +80,7 @@ jobs:
           # An abi3 wheel must be tagged cp310-abi3, not cp310-cp310. Without this the
           # single-artefact promise silently becomes false.
           ls crates/witchhat-py/dist/ | grep -q 'cp310-abi3' || { echo "wheel is not abi3"; exit 1; }
+          ls crates/witchhat-py/dist/ | grep -q '${{ matrix.arch }}' || { echo "wheel is not tagged ${{ matrix.arch }}"; exit 1; }
           python -m pip install --upgrade pip
           python -m pip install crates/witchhat-py/dist/*.whl
           python -c "
@@ -81,7 +97,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: wheel-manylinux-x86_64
+          name: wheel-manylinux-${{ matrix.arch }}
           path: crates/witchhat-py/dist/*.whl
           if-no-files-found: error
 
@@ -95,6 +111,9 @@ jobs:
         # One abi3 wheel must load on every interpreter the project claims to support.
         # DBR 16.4 LTS and 17.3 LTS both ship Python 3.12.3, so one 3.12 job covers both;
         # 3.10 is the abi3 floor and 3.13 checks the forward half of the promise.
+        # x86_64 only: the wheel job's own native-runner round-trip already proves the
+        # aarch64 wheel executes correctly, and duplicating the full interpreter matrix
+        # on ARM64 runners would roughly double this job's runtime for the same signal.
         include:
           - python: "3.10"
             label: "Python 3.10 (abi3 floor)"

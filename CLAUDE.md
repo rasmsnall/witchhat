@@ -3,11 +3,12 @@
 Python library, implemented in Rust, of native data-transformation kernels aimed at
 Spark/Databricks workloads. Status: **eight kernels implemented end to end** (composite
 hashing, schema validation, JSON normalization, regex cleanup, output-equivalence
-testing, deduplication, join, aggregate). Filter/project need no witchhat kernel (Arrow's
-own compute kernels already cover them). Remaining open items are broader `aggregate`
-type support and deeper JSON normalization; package-repo publishing and live Databricks
-Volumes verification were raised and explicitly closed as not pursued (see "Open items"
-below).
+testing, deduplication, join, aggregate), plus a pure-Python `witchhat.spark` layer
+bridging them to `pyspark.sql.DataFrame`, plus `aarch64` (Graviton) wheels alongside
+`x86_64` in CI. Filter/project need no witchhat kernel (Arrow's own compute kernels
+already cover them). Remaining open items are broader `aggregate` type support and
+deeper JSON normalization; package-repo publishing and live Databricks Volumes
+verification were raised and explicitly closed as not pursued (see "Open items" below).
 
 ## Goals / constraints (from the user, verbatim intent)
 
@@ -63,6 +64,7 @@ crates/witchhat-py/src/python.rs       the actual pyo3 bindings (register())
 crates/witchhat-py/python/witchhat/__init__.py    re-exports _witchhat, __all__, __version__
 crates/witchhat-py/python/witchhat/__init__.pyi   type stubs, one docstring per export
 crates/witchhat-py/python/witchhat/py.typed
+crates/witchhat-py/python/witchhat/spark.py       pure Python, no Rust: mapInArrow bridge to pyspark
 crates/witchhat-py/pyproject.toml      maturin config (abi3-py310, mixed layout)
 rust-toolchain.toml   pins rustc/rustfmt/clippy to one version
 README.md
@@ -71,7 +73,8 @@ docs/api.md
 docs/operations.md
 tools/md2docx.py      generates docs/*.docx from docs/*.md
 tools/smoke.py        round-trips a real pyarrow batch through the built wheel, every function
-.github/workflows/ci.yml   fmt+clippy+test+doc job, manylinux abi3 wheel job, multi-interpreter matrix
+tools/spark_smoke.py  same, for witchhat.spark, against a real local pyspark session
+.github/workflows/ci.yml   fmt+clippy+test+doc job, manylinux abi3 wheel matrix (x86_64+aarch64), multi-interpreter matrix
 ```
 
 Two-crate split (`witchhat-core` has no PyO3 dependency; `witchhat-py` is a thin
@@ -91,6 +94,18 @@ doesn't implement `ToPyArrow`/`FromPyArrow` for typed arrays directly.
 job interprets), but would silently produce *wrong data* in a join or a group-by, so
 those two kernels use `arrow_row`'s exact byte-comparable row format instead. See
 `docs/architecture.md` Chapter IX, Section 2.
+
+**pyspark gotcha found and worked around, worth remembering**: `pyspark.sql.types.
+StructType.add()` mutates and returns `self`, not a copy. Calling it on a live
+`DataFrame`'s own `df.schema` (`df.schema.add(...)`) silently corrupts that `df`:
+`df.columns` afterward reports the added field even though the JVM plan was never given
+it, and the *next* `mapInArrow` call on that `df` fails with an unresolved-column error
+naming the field that was just "added". Found by reproducing it in bare pyspark with no
+witchhat code involved at all. `witchhat/spark.py`'s `_with_field` helper works around it
+by building a fresh `StructType` from `list(schema.fields)` instead; see
+`docs/architecture.md` Chapter XVI, Section 4. If a future output-schema helper needs a
+modified `StructType`, go through `_with_field`, never `.add()` on anything the caller
+still holds.
 
 ## Dependency budget
 
@@ -146,11 +161,17 @@ Chapter numbers shift as kernels are added; always check the Contents section of
 ## CI
 
 Adopted the same shape as `rust-streamer-pgdb`'s `.github/workflows/ci.yml`: a
-format/clippy/test/doc job, a manylinux abi3 wheel job that verifies the `cp310-abi3` tag
-and round-trips a real pyarrow batch through the built wheel (`tools/smoke.py`), and a
-matrix job installing that one wheel on Python 3.10/3.12/3.13 to prove the abi3 promise
-holds across interpreters. No optional Cargo features exist yet (unlike pgdb's
-`azure`/`fast-gzip`/`zstd`), so the workspace-wide commands need no feature flags.
+format/clippy/test/doc job, a manylinux abi3 wheel job (matrixed over `x86_64` on
+`ubuntu-latest` and `aarch64` on `ubuntu-24.04-arm`, a real native ARM64 runner, not
+QEMU) that verifies the `cp310-abi3` tag and architecture tag and round-trips a real
+pyarrow batch through the wheel it just built (`tools/smoke.py`), and a matrix job
+installing the `x86_64` wheel on Python 3.10/3.12/3.13 to prove the abi3 promise holds
+across interpreters (not duplicated for `aarch64`: the wheel job's own native-runner
+round-trip already proves that wheel executes; doubling the interpreter matrix onto ARM
+runners would roughly double this job's runtime for the same signal). No optional Cargo
+features exist yet (unlike pgdb's `azure`/`fast-gzip`/`zstd`), so the workspace-wide
+commands need no feature flags. `witchhat.spark` is pure Python and not covered by this
+CI at all (see `tools/spark_smoke.py` instead, run manually).
 
 ## Open items
 
@@ -207,6 +228,21 @@ Resolved and shipped:
   doctests, all passing.
 - `rust-toolchain.toml` pinned; CI and docs/CI conventions adopted from
   `rust-streamer-pgdb`.
+- `witchhat.spark` (`spark.py`, pure Python, no Rust changes): `hash_rows`/
+  `clean_with_preset`/`clean_with_rules` (row-local), `drop_duplicates`/`aggregate`
+  (partition-coordinating, buffer a whole partition via `pa.concat_batches`, default
+  `repartition=True` for whole-DataFrame correctness, `aggregate` refuses an empty
+  `group_by`), `broadcast_join`/`collect_as_record_batch` (broadcast pattern, not a
+  shuffle join), `to_arrow_schema`/`validate_schema`/`schema_fingerprint` (schema
+  helpers). Verified: schema-level logic directly against a real local `SparkSession`
+  (schema conversion, the `_with_field` fix, aggregate/broadcast-join output-schema
+  construction). Not fully verified: full `mapInArrow` execution end to end in this
+  session's sandbox, blocked by a local JDK 17+/21-vs-bundled-Arrow-Java incompatibility
+  confirmed to affect bare `pyspark` (`mapInPandas` with no witchhat code at all), not
+  specific to witchhat and not expected on Databricks; see Environment notes and
+  `tools/spark_smoke.py`.
+- ARM64 wheel: CI now builds and verifies `aarch64` alongside `x86_64`, both on native
+  runners (see "CI" above).
 
 Still open:
 
@@ -214,6 +250,13 @@ Still open:
   aggregation are unbuilt (`Sum`/`Mean`/`Min`/`Max` are numeric-only today).
 - Deeper JSON normalization: array-valued fields and more than one level of object
   nesting are unbuilt (fall into the type-mismatch case in `normalize_json` today).
+- A distributed shuffle join through witchhat: `witchhat.spark.broadcast_join` only
+  covers the broadcast pattern; deliberately not pursuing a large-large join wrapper,
+  since Spark's own `DataFrame.join` already does that better (`docs/architecture.md`
+  Chapter XVI, Section 5).
+- Full live execution testing of `witchhat.spark`'s `mapInArrow` path, blocked in this
+  session by a local JDK/pyspark JVM issue, not by anything in the code; see the
+  "Resolved and shipped" entry above and Environment notes.
 - **Closed, not open**: publishing to a package repository, and live-verifying
   installation from a Databricks Unity Catalog Volume. Both were raised, then the user
   explicitly said to skip package-repo publishing and to leave Volumes install as
@@ -230,9 +273,23 @@ Still open:
 ## Environment notes
 
 - Rust 1.94.0 (pinned via `rust-toolchain.toml`), Python 3.10.11, maturin 1.15.0,
-  python-docx 1.2.0.
+  python-docx 1.2.0, JDK 21 (Temurin).
 - `cargo fmt --all` reformats aggressively; run it after any hand-edit to `.rs` files
   before committing, since CI checks `cargo fmt --all --check`.
 - No `gh` CLI in this environment (neither Git Bash nor PowerShell `PATH`). Pushing to
   GitHub uses `git push` directly against an `origin` remote the user creates and shares
   the URL/name for; this session cannot create a GitHub repo itself.
+- **Local pyspark cannot fully execute `mapInArrow`/`mapInPandas`/any Arrow-based Python
+  UDF in this environment** (tried pyspark 3.5.9 and 4.2.0, both fail identically):
+  `UnsupportedOperationException: sun.misc.Unsafe or java.nio.DirectByteBuffer.<init>
+  (long, int) not available`, thrown inside `org.apache.arrow.memory.util.MemoryUtil`
+  before any Python code runs. Confirmed via a bare `df.mapInPandas(...)` with zero
+  witchhat involvement, so it is a JDK 21 (only JDK on this machine)-vs-pyspark's-bundled
+  Arrow-Java incompatibility, not a witchhat bug, and not expected on Databricks (which
+  controls its own JDK/Arrow versions). `--add-opens=java.base/java.nio=ALL-UNNAMED` (and
+  siblings) via `JDK_JAVA_OPTIONS`/`PYSPARK_SUBMIT_ARGS` did not resolve it here; a JDK 17
+  install likely would, untested (no JDK 17 available on this machine at the time). Do
+  not re-diagnose this from scratch in a future session: it is an environment limitation,
+  not a code defect, and `tools/spark_smoke.py` already detects and explains it instead
+  of failing with a bare stack trace. Non-`mapInArrow` pyspark operations (plain
+  `.collect()`, `SparkSession` creation, schema access) work fine.

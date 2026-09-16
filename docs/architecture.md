@@ -1,10 +1,10 @@
 # witchhat: Architecture
 
 **Document type** Technical architecture specification
-**Status** Eight kernels (composite hashing, schema validation, JSON normalization, regex cleanup, output-equivalence testing, deduplication, join, aggregate) are implemented end to end, behind both the Rust and the Python surface. Filter and project need no witchhat-specific kernel (Arrow's own compute kernels already cover them); see Chapter XVIII for what remains.
+**Status** Eight kernels (composite hashing, schema validation, JSON normalization, regex cleanup, output-equivalence testing, deduplication, join, aggregate) are implemented end to end, behind both the Rust and the Python surface, plus a Spark/Databricks integration layer (Chapter XVI). Filter and project need no witchhat-specific kernel (Arrow's own compute kernels already cover them); see Chapter XIX for what remains.
 **Audience** Anyone integrating, operating, or extending this library. No prior context assumed.
 **Companion documents** `api.md` for the callable surface, `operations.md` for building and deploying it.
-**Version** 1.4
+**Version** 1.5
 **Date** 2026-09-16
 
 ---
@@ -62,12 +62,18 @@
 - XV. Python Binding Boundary
   - 1. The pyo3 version pin
   - 2. Two-crate split
-- XVI. Dependencies
-- XVII. Assessment
+- XVI. Databricks/Spark Integration
+  - 1. What it is and is not
+  - 2. Row-local versus partition-coordinating wrappers
+  - 3. The `uint64` problem
+  - 4. Why `df.schema.add(...)` is not used
+  - 5. `broadcast_join`, not a shuffle join
+- XVII. Dependencies
+- XVIII. Assessment
   - 1. Advantages
   - 2. Disadvantages
   - 3. Conditions under which this design is inappropriate
-- XVIII. Status and What Comes Next
+- XIX. Status and What Comes Next
 - References
 - Appendix A. Glossary
 
@@ -79,7 +85,8 @@
 - `<Table 5-1>` JSON-to-Arrow type mapping
 - `<Table 6-1>` Built-in cleanup presets (`v1`)
 - `<Table 10-1>` Aggregate functions
-- `<Table 16-1>` Direct dependencies
+- `<Table 16-1>` `witchhat.spark` functions by correctness class
+- `<Table 17-1>` Direct dependencies
 - `<Table A-1>` Glossary of terms
 
 ### List of Figures
@@ -123,7 +130,7 @@ infrastructure for future SIMD kernels (Chapter XI).
 Explicitly not in scope, by design: filter (row selection by a boolean predicate) and
 project (column selection/reorder) already exist as Arrow compute kernels
 (`arrow_select::filter::filter_record_batch`, `RecordBatch::project`) with no
-witchhat-specific behaviour to add, so witchhat does not wrap them. See Chapter XVIII and
+witchhat-specific behaviour to add, so witchhat does not wrap them. See Chapter XIX and
 the repository's `README.md` for anything still genuinely open.
 
 Also not in scope, by design: witchhat is not a distributed engine. It targets
@@ -572,7 +579,7 @@ by its input size; none spawn threads, perform I/O, or hold a lock across a call
 PyO3 boundary (Chapter XV) does not release the GIL during a call, because every
 current operation is CPU-bound and short relative to the cost of a Python call itself.
 This is expected to change once a kernel is expensive enough that releasing the GIL for
-the duration becomes worth its own overhead; Chapter XVIII tracks it as an open item.
+the duration becomes worth its own overhead; Chapter XIX tracks it as an open item.
 
 ## XIII. Failure Model
 
@@ -638,9 +645,98 @@ single-crate layout, and is deliberate here: a future Rust-only consumer (a CLI,
 service embedding witchhat directly) links `witchhat-core` without pulling in `pyo3` or
 its `abi3`/`extension-module` feature machinery at all.
 
-## XVI. Dependencies
+## XVI. Databricks/Spark Integration
 
-<Table 16-1> Direct dependencies
+### 1. What it is and is not
+
+`witchhat.spark` (`crates/witchhat-py/python/witchhat/spark.py`, pure Python, no Rust
+involved) is a bridge from `pyspark.sql.DataFrame` to the kernels already described in
+Chapters III-X, built on `DataFrame.mapInArrow`. It is not a second implementation of
+those kernels and not a distributed engine of its own: every wrapper still calls straight
+into the compiled `witchhat` functions on one `RecordBatch` at a time.
+
+Lazily imported: `witchhat.spark`'s functions `import pyspark` inside their own bodies
+and raise a clear `ImportError` if it is missing, so `import witchhat` never depends on
+pyspark, matching the same principle Chapter II applies to `pyarrow` (witchhat depends on
+Arrow, not on any one Arrow-producing library). Databricks always has pyspark available;
+elsewhere it is an explicit `pip install pyspark`.
+
+<Table 16-1> `witchhat.spark` functions by correctness class
+
+| Class | Functions | Guarantee |
+|---|---|---|
+| Row-local | `hash_rows`, `clean_with_preset`, `clean_with_rules` | Correct regardless of partitioning; streams one input batch to one output batch |
+| Partition-coordinating | `drop_duplicates`, `aggregate` | Correct for the whole `DataFrame` only when repartitioned by the relevant columns first (the default); buffers a whole partition before running the kernel |
+| Broadcast | `broadcast_join` | Correct per partition against a fixed, already-collected side; streams without buffering |
+
+### 2. Row-local versus partition-coordinating wrappers
+
+`mapInArrow` calls its function once per partition, but can hand that function more than
+one `RecordBatch` for the same partition (Spark chunks a partition's rows according to
+`spark.sql.execution.arrow.maxRecordsPerBatch`). A row-local kernel does not care: hashing
+or cleaning one batch is unaffected by what is in any other batch. `drop_duplicates` and
+`aggregate` are different: calling `witchhat.drop_duplicates`/`witchhat.aggregate`
+separately on each incoming batch would silently miss a duplicate, or split one group's
+rows into two output rows, whenever Spark happened to split them across batch boundaries
+within the same partition. Both therefore consume the whole partition's iterator first
+(`pa.concat_batches`) and call the kernel exactly once per partition, trading peak memory
+(a whole partition's data, materialized) for correctness.
+
+That still leaves the *cross-partition* half of correctness, which `mapInArrow` cannot
+see at all: two duplicate rows, or two rows of the same aggregate group, that Spark placed
+in different partitions are invisible to each other. `repartition=True` (the default on
+both functions) calls `df.repartition(*columns)` first, so that Spark's own
+hash-partitioning guarantees every row sharing those column values lands in one partition
+before the buffered, per-partition kernel call ever runs. This is why the default is
+described as *safe*, not merely convenient, and why `aggregate` refuses an empty
+`group_by` outright (Section entries above) rather than silently returning a partial
+answer under `repartition=False`: a whole-table aggregate needs every row in the same
+partition, which hash-partitioning by an empty key list cannot arrange.
+
+### 3. The `uint64` problem
+
+`hash_rows`'s underlying kernel produces `uint64`, but `pyspark.sql.pandas.types.
+from_arrow_schema` raises `PySparkTypeError` on a `uint64` Arrow field: Spark SQL has no
+unsigned integer type at all. `witchhat.spark.hash_rows` reinterprets the same bits as
+`int64` via `pyarrow.Array.view` (a bit cast, not a value conversion), then stores that in
+a Spark `LongType` column. Equality, joins, and group-bys against the resulting column
+behave identically to the original `uint64`, since the bits, and therefore what "equal"
+means, are unchanged; only the decimal Spark prints for a hash whose high bit happens to
+be set can look negative. Documented at the point the value is produced
+(`witchhat.spark.hash_rows`'s docstring), not left as a surprise for whoever first
+prints one.
+
+### 4. Why `df.schema.add(...)` is not used
+
+Found while first building this module, not by inspection: `pyspark.sql.types.
+StructType.add()` mutates the `StructType` it is called on and returns that same object,
+rather than a copy. Calling it directly on a live `DataFrame`'s own schema, as
+`df.schema.add("new_col", ...)`, therefore corrupts `df` itself: `df.columns` afterward
+reports the added field even though the underlying JVM query plan was never given it, and
+the *next* `mapInArrow` call on that same `df` (even one unrelated to the field just
+added) fails with `AnalysisException: A column ... cannot be resolved`, naming the field
+this code was trying to add as an output column in the first place. Every place in
+`witchhat.spark` that needs an output schema with one extra field
+(`hash_rows`, `clean_with_preset`/`clean_with_rules` when writing to a new column) goes
+through a small `_with_field` helper instead, which builds a fresh `StructType` from
+`list(schema.fields)` and never calls `.add()` on anything the caller still holds a
+reference to.
+
+### 5. `broadcast_join`, not a shuffle join
+
+witchhat is not a distributed engine (Chapter I, Section 3), so it has no way to perform
+the kind of large-large shuffle join `DataFrame.join` does, where Spark itself
+repartitions both sides by key and merges them across the cluster. `broadcast_join`
+instead mirrors Spark's own broadcast-join optimization: the small side is collected to
+the driver once (`collect_as_record_batch`, using `DataFrame.toArrow()` where available,
+`toPandas()` otherwise), wrapped in a Spark `Broadcast` so every executor gets one copy,
+and joined locally against each partition's batch with `witchhat.join`. A large-large
+join is explicitly out of scope for this function; `DataFrame.join` remains the right
+tool for that, not something to route through a per-partition Python call.
+
+## XVII. Dependencies
+
+<Table 17-1> Direct dependencies
 
 | Crate | Why |
 |---|---|
@@ -658,7 +754,7 @@ Pinned 2026-09 (probed via `cargo build`; crates.io index reachable): `arrow 56.
 `xxhash-rust 0.8.18`, `serde_json 1.0.151`, `regex 1.13.1`, `thiserror 2.0.20`,
 `pyo3 0.25.1`.
 
-## XVII. Assessment
+## XVIII. Assessment
 
 ### 1. Advantages
 
@@ -673,8 +769,11 @@ Pinned 2026-09 (probed via `cargo build`; crates.io index reachable): `arrow 56.
   collision would silently produce wrong data, not just weaker evidence.
 - Deduplication reuses the hashing kernel rather than adding a second row-comparison
   algorithm; filter and project were left to Arrow's own kernels rather than reinvented.
+- `witchhat.spark`'s partition-coordinating wrappers default to *correct*
+  (repartition-by-key), not merely fast, and document precisely which of the two each
+  function is (Chapter XVI, Table 16-1).
 - No `unsafe` in this crate's own code; the dependency surface is small and each
-  dependency's role is documented (Chapter XVI).
+  dependency's role is documented (Chapter XVII).
 
 ### 2. Disadvantages
 
@@ -694,6 +793,9 @@ Pinned 2026-09 (probed via `cargo build`; crates.io index reachable): `arrow 56.
   accumulate through `f64` (Chapter X, Section 3).
 - `join` requires an exact Arrow type match between paired key columns; no implicit
   coercion, matching `validate_schema`'s own conservatism (Chapter IV, Section 2).
+- `witchhat.spark.broadcast_join` covers only the broadcast pattern; a large-large
+  shuffle join has no witchhat-provided path and is left to `DataFrame.join` itself
+  (Chapter XVI, Section 5).
 
 ### 3. Conditions under which this design is inappropriate
 
@@ -708,15 +810,19 @@ Pinned 2026-09 (probed via `cargo build`; crates.io index reachable): `arrow 56.
   `check_equivalence`, rather than equivalence-testing evidence.
 - An aggregate over non-numeric columns beyond `Count`, or over `Decimal`/`Date`/
   `Time`/`Timestamp` columns.
+- A large-large distributed join or an unpartitioned whole-table aggregate: use
+  `DataFrame.join`/`DataFrame.groupBy(...).agg(...)` directly rather than
+  `witchhat.spark` (Chapter XVI).
 
-## XVIII. Status and What Comes Next
+## XIX. Status and What Comes Next
 
 Implemented and tested: composite row/table hashing (now covering Date/Time/Timestamp/
 Decimal in addition to the original numeric/string/binary set), schema fingerprinting
 and validation, JSON normalization, regex cleanup (ad hoc and presets),
 output-equivalence testing, deduplication, join (inner/left/right/full), aggregate
-(count/sum/mean/min/max), CPU feature detection, the Python binding boundary, the
-`abi3-py310` wheel build.
+(count/sum/mean/min/max), CPU feature detection, the Python binding boundary, a
+Databricks/Spark integration layer (`witchhat.spark`, Chapter XVI), the `abi3-py310`
+wheel build now cross-built for both `x86_64` and `aarch64` (Graviton) manylinux targets.
 
 Publishing to a package repository and verifying installation from a Unity Catalog
 Volume against a live workspace were both raised and then deliberately decided against
@@ -757,5 +863,7 @@ scratch.
 | Preset | A named, versioned built-in `CleanRule` set; see Chapter VI |
 | `EquivalenceReport` | The structured result of `check_equivalence`; see Chapter VII |
 | Row format | `arrow_row`'s canonical, memcmp-comparable byte encoding of one or more columns; the basis for `join` and `aggregate`'s grouping; see Chapter IX, Section 2 |
+| Partition-coordinating | A `witchhat.spark` function whose correctness across a whole `DataFrame` needs related rows already in the same partition; see Chapter XVI, Sections 1-2 |
+| `broadcast_join` | Joins each partition against one small side already collected to the driver; not a distributed shuffle join; see Chapter XVI, Section 5 |
 | abi3 | CPython's stable ABI; one compiled extension loads on every Python from the
 declared floor version onward |

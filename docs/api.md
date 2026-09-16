@@ -1,10 +1,10 @@
 # witchhat: API Reference
 
 **Document type** Interface specification
-**Status** Describes the surface as built: composite hashing, schema validation, JSON normalization, regex cleanup, output-equivalence testing, deduplication, join, aggregate, and schema/CPU introspection.
+**Status** Describes the surface as built: composite hashing, schema validation, JSON normalization, regex cleanup, output-equivalence testing, deduplication, join, aggregate, schema/CPU introspection, and the `witchhat.spark` Databricks/Spark integration layer.
 **Audience** Anyone calling this library from Python or from Rust.
 **Companion documents** `architecture.md` for why the design is shaped this way, `operations.md` for building and deploying it.
-**Version** 1.3
+**Version** 1.4
 **Date** 2026-09-16
 
 ---
@@ -28,12 +28,21 @@
   - 11. `join`
   - 12. `aggregate`
   - 13. `cpu_features` and `CpuFeatures`
-- III. Rust Surface
+- III. Databricks/Spark Surface (`witchhat.spark`)
+  - 1. Import and dependency
+  - 2. `to_arrow_schema`, `map_in_arrow`
+  - 3. `hash_rows`
+  - 4. `clean_with_preset`, `clean_with_rules`
+  - 5. `drop_duplicates`
+  - 6. `aggregate`
+  - 7. `collect_as_record_batch`, `broadcast_join`
+  - 8. `validate_schema`, `schema_fingerprint`
+- IV. Rust Surface
   - 1. Entry points
   - 2. Version enums
   - 3. Module map
   - 4. Error type
-- IV. Semantics Callers Must Know
+- V. Semantics Callers Must Know
   - 1. Column order
   - 2. Null and float equality
   - 3. Version pinning
@@ -42,13 +51,15 @@
   - 6. `check_equivalence` is stricter than "not breaking"
   - 7. `join` requires exact key-type matches
   - 8. `aggregate` is numeric-only beyond `Count`
-- V. Worked Examples
+  - 9. `witchhat.spark`'s `repartition=True` default
+- VI. Worked Examples
   - 1. Deduplicating rows
   - 2. Checking output against Spark
   - 3. Validating a batch before processing it
   - 4. Normalizing JSON, then cleaning a column
   - 5. Joining and aggregating
-  - 6. Calling from Rust
+  - 6. A Databricks notebook pipeline with `witchhat.spark`
+  - 7. Calling from Rust
 - References
 - Appendix A. Parameter quick reference
 
@@ -61,7 +72,8 @@
 - `<Table 2-5>` Built-in cleanup presets
 - `<Table 2-6>` Fields and methods of `EquivalenceReport`
 - `<Table 2-7>` Aggregate functions accepted by `aggregate`
-- `<Table 3-1>` Public Rust modules
+- `<Table 3-1>` `witchhat.spark` functions
+- `<Table 4-1>` Public Rust modules
 - `<Table A-1>` Parameter quick reference
 
 ### List of Figures
@@ -80,9 +92,13 @@ It does not explain the internal design, which is `architecture.md`'s subject.
 
 ### 2. Which surface to use
 
-The Python surface (Chapter II) is the intended entry point for a Databricks notebook or
-job. The Rust surface (Chapter III) is for embedding witchhat directly in a Rust binary
-or service with no Python in the loop; it is what `witchhat-py` itself calls.
+The Python surface (Chapter II) is the entry point for working with a single Arrow
+batch already in hand. The Databricks/Spark surface (Chapter III,
+`witchhat.spark`) is the entry point for calling witchhat against a
+`pyspark.sql.DataFrame` in a Databricks notebook or job; it is built entirely on
+Chapter II underneath. The Rust surface (Chapter IV) is for embedding witchhat
+directly in a Rust binary or service with no Python in the loop; it is what
+`witchhat-py` itself calls.
 
 ## II. Python Surface
 
@@ -310,7 +326,118 @@ Returns a `CpuFeatures` instance with boolean properties `sse42`, `avx2`, `avx51
 `neon`. See `architecture.md` Chapter XI for why this exists and what it does (and does
 not yet) affect.
 
-## III. Rust Surface
+## III. Databricks/Spark Surface (`witchhat.spark`)
+
+Pure Python, calling straight into the functions above; not a second implementation.
+See `architecture.md` Chapter XVI for the design (row-local vs. partition-coordinating
+functions, the `uint64` problem, why `broadcast_join` is not a shuffle join).
+
+### 1. Import and dependency
+
+```python
+from witchhat import spark as wspark
+```
+
+Every function lazily imports pyspark and raises `ImportError` with an install hint if
+it is missing; `import witchhat` itself never requires pyspark.
+
+<Table 3-1> `witchhat.spark` functions
+
+| Function | Class | Signature |
+|---|---|---|
+| `to_arrow_schema` | schema helper | `(schema_or_df) -> pyarrow.Schema` |
+| `map_in_arrow` | primitive | `(df, func, schema) -> DataFrame` |
+| `hash_rows` | row-local | `(df, columns, output_column="row_hash", version="v1") -> DataFrame` |
+| `clean_with_preset` | row-local | `(df, column, name, output_column=None, version="v1") -> DataFrame` |
+| `clean_with_rules` | row-local | `(df, column, rules, output_column=None) -> DataFrame` |
+| `drop_duplicates` | partition-coordinating | `(df, columns, version="v1", repartition=True) -> DataFrame` |
+| `aggregate` | partition-coordinating | `(df, group_by, aggregations, repartition=True) -> DataFrame` |
+| `collect_as_record_batch` | driver collection | `(df) -> pyarrow.RecordBatch` |
+| `broadcast_join` | broadcast | `(df, small_table, left_keys, right_keys, how="inner") -> DataFrame` |
+| `validate_schema` | schema helper | `(df, expected, allow_numeric_widening=False) -> SchemaDiff` |
+| `schema_fingerprint` | schema helper | `(df, version="v1") -> int` |
+
+### 2. `to_arrow_schema`, `map_in_arrow`
+
+`to_arrow_schema(schema_or_df)` converts a `pyspark.sql.types.StructType` (or a
+`DataFrame`, whose `.schema` is used) to a `pyarrow.Schema`, via pyspark's own
+`pyspark.sql.pandas.types.to_arrow_schema`. `map_in_arrow(df, func, schema)` is a thin,
+documented wrapper around `DataFrame.mapInArrow`: every other function below is built on
+it, and it is the escape hatch for anything not already wrapped.
+
+### 3. `hash_rows`
+
+```python
+wspark.hash_rows(df, columns, output_column="row_hash", version="v1") -> DataFrame
+```
+
+Adds `output_column` (Spark `LongType`), one witchhat row hash per row over `columns`.
+Row-local, correct regardless of partitioning. The value is `witchhat.hash_rows`'s
+`uint64` result bit-reinterpreted as `int64` (Spark/Arrow interop has no unsigned type):
+equality, joins and group-bys on it behave identically to the `uint64`; `df.show()` can
+print a negative number for a hash with its high bit set.
+
+### 4. `clean_with_preset`, `clean_with_rules`
+
+```python
+wspark.clean_with_preset(df, column, name, output_column=None, version="v1") -> DataFrame
+wspark.clean_with_rules(df, column, rules, output_column=None) -> DataFrame
+```
+
+`column` in place by default (`output_column=None`), or a new string column if given.
+Row-local, thin wrappers around `witchhat.clean_with_preset`/`clean_with_rules`.
+
+### 5. `drop_duplicates`
+
+```python
+wspark.drop_duplicates(df, columns, version="v1", repartition=True) -> DataFrame
+```
+
+`witchhat.drop_duplicates` applied once per partition, after buffering that partition's
+batches into one (`mapInArrow` can hand back more than one batch per partition; applying
+the kernel to each separately could miss a duplicate split across two of them).
+`repartition=True` (default) calls `df.repartition(*columns)` first, which is what makes
+the result correct for the whole `DataFrame`, not just within whatever partition Spark
+happened to place each row in. See Section 9 below before passing `repartition=False`.
+
+### 6. `aggregate`
+
+```python
+wspark.aggregate(df, group_by, aggregations, repartition=True) -> DataFrame
+```
+
+`witchhat.aggregate` applied once per partition, buffered the same way as
+`drop_duplicates`. `repartition=True` (default) calls `df.repartition(*group_by)` first.
+Unlike `witchhat.aggregate`, `group_by` must be non-empty: a whole-table aggregate needs
+every row in one partition, which hash-repartitioning cannot arrange, so this raises
+`ValueError` instead of silently returning a partial answer.
+
+### 7. `collect_as_record_batch`, `broadcast_join`
+
+```python
+wspark.collect_as_record_batch(df) -> pyarrow.RecordBatch
+wspark.broadcast_join(df, small_table, left_keys, right_keys, how="inner") -> DataFrame
+```
+
+`collect_as_record_batch` pulls a small `DataFrame` to the driver as one `RecordBatch`
+(`DataFrame.toArrow()` where available, `toPandas()` otherwise). `broadcast_join`
+broadcasts `small_table` (already collected) to every partition and joins each
+partition's batch against it with `witchhat.join`, mirroring Spark's own broadcast-join
+optimization. Not a distributed shuffle join: use `DataFrame.join` directly for two
+large sides.
+
+### 8. `validate_schema`, `schema_fingerprint`
+
+```python
+wspark.validate_schema(df, expected, allow_numeric_widening=False) -> witchhat.SchemaDiff
+wspark.schema_fingerprint(df, version="v1") -> int
+```
+
+`witchhat.validate_schema`/`schema_fingerprint`, converting `df` (and `expected`, if it
+is a `DataFrame` or `StructType` rather than an already-`pyarrow.Schema`) via
+`to_arrow_schema` first.
+
+## IV. Rust Surface
 
 ### 1. Entry points
 
@@ -352,7 +479,7 @@ key matching use `arrow_row`, not `hash_batch` (`architecture.md` Chapter IX, Se
 
 ### 3. Module map
 
-<Table 3-1> Public Rust modules
+<Table 4-1> Public Rust modules
 
 | Module | Contents |
 |---|---|
@@ -377,7 +504,7 @@ result, not an `Error`. `normalize_json` returns `Result` only for a structural 
 (an unsupported target type in `schema`), never for a malformed row, which is counted in
 `NormalizeStats` instead.
 
-## IV. Semantics Callers Must Know
+## V. Semantics Callers Must Know
 
 ### 1. Column order
 
@@ -444,7 +571,18 @@ should be treated as comparable.
 `f64`'s exact-integer range (±2^53) can lose precision in the result; `"min"`/`"max"`
 are unaffected, since they return the original, untouched value from the source column.
 
-## V. Worked Examples
+### 9. `witchhat.spark`'s `repartition=True` default
+
+`drop_duplicates` and `aggregate` in `witchhat.spark` default to `repartition=True`
+because they are only correct for a whole `DataFrame` when Spark has already put every
+related row in one partition; `mapInArrow` gives them no visibility across partitions.
+Pass `repartition=False` only when `df` is already known to be partitioned by the same
+columns (for instance, right after another call in this module repartitioned by them),
+to skip a redundant shuffle. Do not pass it as a general "make this faster" switch: doing
+so on an arbitrarily partitioned `DataFrame` silently produces a partial, wrong answer
+rather than an error.
+
+## VI. Worked Examples
 
 ### 1. Deduplicating rows
 
@@ -513,7 +651,30 @@ totals = witchhat.aggregate(joined, ["country"], [("amount", "sum", "total")])
 # totals: NO -> 15.0, SE -> 20.0
 ```
 
-### 6. Calling from Rust
+### 6. A Databricks notebook pipeline with `witchhat.spark`
+
+```python
+from witchhat import spark as wspark
+
+events = spark.table("bronze.events")  # a large Spark DataFrame
+
+# row-local: safe on the DataFrame exactly as partitioned
+tagged = wspark.hash_rows(events, ["user_id", "event_time"], output_column="event_hash")
+cleaned = wspark.clean_with_preset(tagged, "note", "collapse_whitespace")
+
+# partition-coordinating: repartition=True (the default) makes this correct for the
+# whole DataFrame, not just within whichever partition a row happened to land in
+deduped = wspark.drop_duplicates(cleaned, ["user_id", "event_hash"])
+
+# broadcast a small dimension table and join it in, instead of a large-large shuffle join
+countries = wspark.collect_as_record_batch(spark.table("dim.countries"))
+enriched = wspark.broadcast_join(deduped, countries, ["user_id"], ["user_id"], how="left")
+
+totals = wspark.aggregate(enriched, ["country"], [("amount", "sum", "total")])
+totals.write.saveAsTable("silver.totals_by_country")
+```
+
+### 7. Calling from Rust
 
 ```rust
 use witchhat_core::{HashVersion, hash_batch};
