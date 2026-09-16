@@ -23,20 +23,50 @@ use xxhash_rust::xxh3::Xxh3;
 
 use crate::error::{Error, Result};
 
+/// Names one exact, frozen hashing algorithm.
+///
+/// A variant, once shipped, never changes what it produces: type tags, null handling,
+/// float canonicalization, and the row combiner are all part of its definition. An
+/// improvement to the algorithm ships as a new variant, so a fingerprint computed under
+/// `"v1"` today is still reproducible under `"v1"` next year, and code that needs the old
+/// behaviour can keep asking for it explicitly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HashVersion {
+    /// The first hashing algorithm. See [`hash_batch`] for what it computes.
     V1,
 }
 
 impl HashVersion {
+    /// The version [`hash_batch`] and friends use when a caller does not pin one.
     pub const CURRENT: HashVersion = HashVersion::V1;
 
+    /// The version's stable name, as accepted by [`HashVersion::parse`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use witchhat_core::HashVersion;
+    /// assert_eq!(HashVersion::V1.as_str(), "v1");
+    /// ```
     pub fn as_str(self) -> &'static str {
         match self {
             HashVersion::V1 => "v1",
         }
     }
 
+    /// Parses a version's stable name, as produced by [`HashVersion::as_str`].
+    ///
+    /// Returns `None` for any string that does not name a known version, rather than
+    /// falling back to [`HashVersion::CURRENT`]: silently substituting a different
+    /// algorithm for the one a caller asked for would defeat the point of versioning.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use witchhat_core::HashVersion;
+    /// assert_eq!(HashVersion::parse("v1"), Some(HashVersion::V1));
+    /// assert_eq!(HashVersion::parse("v99"), None);
+    /// ```
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "v1" => Some(HashVersion::V1),
@@ -243,9 +273,57 @@ fn resolve_indices(batch: &RecordBatch, columns: &[&str]) -> Result<Vec<usize>> 
         .collect()
 }
 
-/// Fingerprint the given columns, in the given order, into one `u64` per
-/// row. Columns not listed do not affect the result, and the same columns
-/// in a different order produce a different fingerprint.
+/// Fingerprints the given columns, in the given order, into one `u64` per row.
+///
+/// Columns not listed do not affect the result, and the same columns in a different order
+/// produce a different fingerprint: this is the building block for a dedup or
+/// change-data-capture key, where `(a, b)` and `(b, a)` must not collide. A `null` cell
+/// hashes distinctly from every non-null value of its column, including an empty string
+/// or a zero. `NaN` and `-0.0` are canonicalized before hashing, so every `NaN` bit
+/// pattern collapses to one hash and `0.0`/`-0.0` hash equal, matching IEEE-754 equality
+/// rather than bitwise identity.
+///
+/// Supported Arrow types: `Boolean`, `Int8`..`Int64`, `UInt8`..`UInt64`, `Float32`,
+/// `Float64`, `Utf8`, `LargeUtf8`, `Binary`, `LargeBinary`. A column of any other type
+/// returns [`Error::UnsupportedType`], even if it is not one of the requested `columns`
+/// (every returned index is validated before hashing starts, and every listed column is
+/// hashed).
+///
+/// # Errors
+///
+/// [`Error::UnknownColumn`] if a name in `columns` is not in `batch`'s schema.
+/// [`Error::UnsupportedType`] if a requested column's Arrow type is not one of the types
+/// listed above.
+///
+/// # Panics
+///
+/// Does not panic. Not async; runs on the calling thread in time linear in
+/// `batch.num_rows() * columns.len()`, with no I/O.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Arc;
+/// use arrow_array::{Int64Array, RecordBatch, StringArray};
+/// use arrow_schema::{DataType, Field, Schema};
+/// use witchhat_core::{HashVersion, hash_batch};
+///
+/// let schema = Arc::new(Schema::new(vec![
+///     Field::new("id", DataType::Int64, false),
+///     Field::new("email", DataType::Utf8, false),
+/// ]));
+/// let batch = RecordBatch::try_new(
+///     schema,
+///     vec![
+///         Arc::new(Int64Array::from(vec![1, 2])),
+///         Arc::new(StringArray::from(vec!["a@x.com", "a@x.com"])),
+///     ],
+/// )
+/// .unwrap();
+///
+/// let hashes = hash_batch(&batch, &["email"], HashVersion::CURRENT).unwrap();
+/// assert_eq!(hashes.value(0), hashes.value(1)); // same email, same hash
+/// ```
 pub fn hash_batch(
     batch: &RecordBatch,
     columns: &[&str],
@@ -260,6 +338,15 @@ pub fn hash_batch(
 }
 
 /// [`hash_batch`] over every column in the batch, in schema order.
+///
+/// # Errors
+///
+/// [`Error::UnsupportedType`] if any column's Arrow type is not one [`hash_batch`]
+/// supports.
+///
+/// # Panics
+///
+/// Does not panic. Not async; see [`hash_batch`] for the blocking/complexity notes.
 pub fn hash_batch_all_columns(batch: &RecordBatch, version: HashVersion) -> Result<UInt64Array> {
     let mut acc = vec![version.seed(); batch.num_rows()];
     for column in batch.columns() {
@@ -268,10 +355,40 @@ pub fn hash_batch_all_columns(batch: &RecordBatch, version: HashVersion) -> Resu
     Ok(UInt64Array::from(acc))
 }
 
-/// Order-independent aggregate of row fingerprints: two batches with the
-/// same rows in a different order (a re-shuffled partition, say) produce
-/// the same table fingerprint. Use this to check witchhat's output against
-/// Spark's without forcing either side to sort first.
+/// Folds a batch of row hashes (e.g. from [`hash_batch`]) into one order-independent
+/// `u64`.
+///
+/// The fold is `u64` wrapping addition, which is commutative and associative, so two
+/// batches holding the same rows in a different order (a re-shuffled partition, a
+/// different scan order) produce the same table fingerprint. This is the intended way to
+/// check witchhat's output against Spark's: fingerprint both sides' rows and compare the
+/// two `u64`s, without sorting either side first. It is not collision-free in the way a
+/// per-row comparison is (a sufficiently adversarial input could construct two different
+/// multisets of hashes that sum equal), so treat a match as strong evidence, not a proof,
+/// for anything security-sensitive.
+///
+/// `row_hashes` should be produced with the same [`HashVersion`] passed here; nothing
+/// enforces that, since `row_hashes` is already just a `u64` array by the time it reaches
+/// this function.
+///
+/// # Panics
+///
+/// Does not panic, including on an empty array (returns `version.seed()`). Not async;
+/// runs on the calling thread in time linear in `row_hashes.len()`, with no I/O.
+///
+/// # Examples
+///
+/// ```
+/// use arrow_array::UInt64Array;
+/// use witchhat_core::{HashVersion, table_fingerprint};
+///
+/// let forward = UInt64Array::from(vec![1, 2, 3]);
+/// let shuffled = UInt64Array::from(vec![3, 1, 2]);
+/// assert_eq!(
+///     table_fingerprint(&forward, HashVersion::CURRENT),
+///     table_fingerprint(&shuffled, HashVersion::CURRENT)
+/// );
+/// ```
 pub fn table_fingerprint(row_hashes: &UInt64Array, version: HashVersion) -> u64 {
     row_hashes
         .values()

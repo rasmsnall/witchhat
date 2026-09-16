@@ -4,16 +4,25 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+publish = false
 
 [lib]
-name = "witchhat"
+name = "_witchhat"
+path = "src/lib.rs"
+# cdylib for the Python extension module; rlib so the crate's own tests can link it.
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 arrow = { version = "56", default-features = false, features = ["pyarrow"] }
 arrow-array = { workspace = true }
 arrow-data = "56"
-# pinned to match arrow's `pyarrow` feature, which links pyo3-ffi and only
-# tolerates one exact version across the whole dependency graph
-pyo3 = { version = "=0.25.1", features = ["extension-module", "abi3-py310"] }
+# pinned to match arrow's `pyarrow` feature, which links pyo3-ffi and only tolerates one
+# exact pyo3 version across the whole dependency graph (see docs/architecture.md).
+# extension-module is enabled only for the wheel build (see pyproject.toml), never for
+# `cargo test`, which needs to link libpython.
+pyo3 = { version = "=0.25.1", features = ["abi3-py310"] }
 witchhat-core = { workspace = true }
+
+[features]
+default = []
+extension-module = ["pyo3/extension-module"]

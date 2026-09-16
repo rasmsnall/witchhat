@@ -7,11 +7,20 @@ name = "witchhat"
 version = "0.1.0"
 description = "High-performance data transformation library for Spark/Databricks workloads, with a Rust core"
 requires-python = ">=3.10"
+license = { text = "MIT" }
 classifiers = [
     "Programming Language :: Rust",
-    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering",
 ]
 
+[project.urls]
+Source = "https://github.com/rasmsnall/witchhat"
+
 [tool.maturin]
-module-name = "witchhat"
-features = ["pyo3/extension-module"]
+# The extension-module feature is off in Cargo.toml's default set so `cargo test` links
+# libpython; the wheel build turns it on here. abi3 comes from the always-on pyo3 feature.
+features = ["extension-module"]
+module-name = "witchhat._witchhat"
+python-source = "python"
+strip = true

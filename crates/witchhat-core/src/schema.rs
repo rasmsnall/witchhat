@@ -1,17 +1,38 @@
 //! Canonical schema types.
 //!
-//! witchhat does not define its own schema representation: `arrow_schema`
-//! already is the lingua franca between Spark, Databricks, pyarrow, polars
-//! and pandas, so reusing it is what makes zero-copy interop possible.
+//! witchhat does not define its own schema representation: [`arrow_schema`] already is the
+//! lingua franca between Spark, Databricks, pyarrow, polars and pandas, so reusing it is
+//! what makes zero-copy interop possible.
+
 pub use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 
 use xxhash_rust::xxh3::Xxh3;
 
 use crate::hash::HashVersion;
 
-/// A hash of a schema's shape: field names in order, their types and
-/// nullability. Versioned like row hashes ([`HashVersion`]) so a fingerprint
-/// stored today stays reproducible even if this function's internals change.
+/// Hashes a schema's shape: field names in order, their types, and their nullability.
+///
+/// Versioned like row hashes ([`HashVersion`]) so a fingerprint stored today stays
+/// reproducible even if this function's internals change; a future improvement ships as a
+/// new [`HashVersion`] variant rather than changing what an existing one produces.
+///
+/// Two schemas with the same fields in the same order, same types and same nullability
+/// hash equal; changing the field order, a type, or a nullability flag changes the result.
+/// Does not panic. Not async; runs in time and memory linear in the field count.
+///
+/// # Examples
+///
+/// ```
+/// use arrow_schema::{DataType, Field, Schema};
+/// use witchhat_core::{HashVersion, schema_fingerprint};
+///
+/// let a = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+/// let b = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+/// assert_eq!(
+///     schema_fingerprint(&a, HashVersion::CURRENT),
+///     schema_fingerprint(&b, HashVersion::CURRENT)
+/// );
+/// ```
 pub fn schema_fingerprint(schema: &Schema, version: HashVersion) -> u64 {
     let mut hasher = Xxh3::with_seed(version.seed());
     for field in schema.fields() {

@@ -6,12 +6,27 @@ Spark-native operations (hashing, schema validation, JSON normalization,
 regex-heavy cleanup) with something an order of magnitude faster on a single
 node, while staying byte-for-byte comparable to Spark's output.
 
+## Documentation
+
+- [`docs/architecture.md`](docs/architecture.md): design and rationale.
+- [`docs/api.md`](docs/api.md): the full Python and Rust callable surface.
+- [`docs/operations.md`](docs/operations.md): building the wheel and installing it on
+  Databricks.
+
+Markdown in `docs/` is the source of truth; `python tools/md2docx.py` generates a
+matching `.docx` for each, following the same convention as the companion project
+`rust-streamer-pgdb`. Regenerate after any docs change.
+
 ## Layout
 
 | crate | role |
 | --- | --- |
 | `witchhat-core` | data model and native transformations. Arrow-backed, no Python dependency |
-| `witchhat-py` | PyO3 module (`import witchhat`), abi3 for Python >= 3.10 |
+| `witchhat-py` | PyO3 module (`witchhat._witchhat`), abi3 for Python >= 3.10, mixed layout under `python/witchhat/` |
+
+`rust-toolchain.toml` pins the Rust toolchain (rustc/rustfmt/clippy) so CI and a
+developer's machine agree. `tools/smoke.py` round-trips a real pyarrow batch through the
+built wheel; `.github/workflows/ci.yml` runs it as part of the manylinux wheel build.
 
 ## Quick start, Python
 
@@ -92,14 +107,16 @@ the stated goal needs next:
    can be asserted equal in CI.
 5. **Native transformations.** The actual replacements for Spark operations
    (filter/project/join/aggregate paths), the point of the exercise.
-6. **manylinux wheels + CI.** `abi3-py310` is already wired up; still need
-   the manylinux build (via `maturin`'s Docker/zig cross target) and a
-   reproducible-build check (same inputs -> byte-identical wheel).
-7. **Type hints and generated docs.** Currently a pure-`cdylib` abi3
-   extension with no `.pyi` stubs; needs a mixed Rust/Python maturin layout
-   (`python/witchhat/__init__.pyi` + `py.typed`) and a docs generator.
+6. **Reproducible-build check.** manylinux abi3 wheel build + CI are done (see
+   `.github/workflows/ci.yml`); still need a same-inputs -> byte-identical-wheel check.
+7. **Publish to a package repository.** Currently wheel-only, no index; see
+   `docs/operations.md` Chapter III.
 8. **Databricks Volumes distribution.** Confirm `pip install` from a Unity
-   Catalog volume path works with the abi3 wheel as built, and document it.
+   Catalog volume path works with the abi3 wheel as built (documented as the intended
+   path in `docs/operations.md`, not yet verified against a real workspace).
+
+Type hints and generated docs (`.pyi` stubs, `py.typed`, `docs/*.md` + generated
+`.docx`) are done; see the Documentation section above.
 
 ## Tests
 
@@ -107,7 +124,10 @@ the stated goal needs next:
 cargo test --workspace
 ```
 
-11 tests: hash determinism, column-order sensitivity, null-vs-value
-distinctness, type-tag collision avoidance, float canonicalization
-(NaN, -0.0), unknown-column errors, order-independent table fingerprints,
-and schema-fingerprint sensitivity to field order/type/nullability.
+11 unit tests plus 6 doctests, all in `witchhat-core`: hash determinism, column-order
+sensitivity, null-vs-value distinctness, type-tag collision avoidance, float
+canonicalization (NaN, -0.0), unknown-column errors, order-independent table
+fingerprints, and schema-fingerprint sensitivity to field order/type/nullability.
+`cargo doc --no-deps -p witchhat-core` and `cargo clippy --workspace --all-targets`
+both run clean with warnings denied (`missing_docs`, `broken_intra_doc_links`, clippy's
+default lint set); see `.github/workflows/ci.yml`.

@@ -1,0 +1,5 @@
+# Revisions that changed formatting only. Skip them when attributing lines:
+#
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# GitHub honours this file automatically.
