@@ -11,7 +11,7 @@ and printing both numbers so a reader can judge for themselves.
 
 Run after installing the wheel and pyspark (see docs/operations.md):
 
-    pip install pyspark
+    pip install pyspark pandas
     python tools/spark_benchmark.py [--rows N]
 
 Not part of CI (see witchhat.spark's module docstring for why pyspark stays an

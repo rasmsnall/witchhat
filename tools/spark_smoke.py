@@ -2,7 +2,7 @@
 
 Run after installing the wheel and pyspark (see docs/operations.md):
 
-    pip install pyspark
+    pip install pyspark pandas
     python tools/spark_smoke.py
 
 Runs in CI too (the `spark-integration` job in `.github/workflows/ci.yml`,

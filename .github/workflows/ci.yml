@@ -195,6 +195,10 @@ jobs:
         run: |
           set -eux
           python -m pip install --upgrade pip
-          python -m pip install dist/*.whl pyarrow pyspark
+          # pandas is a real runtime dependency of mapInArrow itself (pyspark builds
+          # it on pandas_udf internally and raises PySparkImportError without it),
+          # not just a witchhat.spark convenience; easy to miss locally if pandas
+          # happens to already be installed for an unrelated reason.
+          python -m pip install dist/*.whl pyarrow pandas pyspark
       - name: Run witchhat.spark against a real local Spark session
         run: python tools/spark_smoke.py
