@@ -63,6 +63,25 @@ jobs:
         with:
           python-version: "3.10"
 
+      # Bakes the exact source commit this wheel was built from into the wheel
+      # itself, as a plain Python constant (witchhat.__commit__), so a downloaded
+      # wheel is traceable to a commit even detached from this workflow run's own
+      # metadata. See crates/witchhat-py/python/witchhat/_build_info.py for what
+      # this does and does not prove (not a full SBOM, not a signature).
+      - name: Stamp build provenance
+        run: |
+          set -eux
+          cat > crates/witchhat-py/python/witchhat/_build_info.py <<EOF
+          """Provenance for this build; see this file's own docstring in source
+          control for what these constants do and do not prove. Overwritten by
+          CI's wheel job just before building; the source-controlled version
+          has both constants as None.
+          """
+
+          COMMIT: str | None = "${{ github.sha }}"
+          BUILT_AT: str | None = "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          EOF
+
       # abi3 comes from the pyo3 feature pinned in witchhat-py/Cargo.toml, so one
       # wheel per architecture covers 3.10 and later.
       - name: Build wheel
@@ -86,8 +105,10 @@ jobs:
           python -c "
           import witchhat
           print('version', witchhat.__version__)
+          print('commit', witchhat.__commit__)
           print('exports', sorted(witchhat.__all__))
           assert callable(witchhat.hash_rows)
+          assert witchhat.__commit__ == '${{ github.sha }}'
           "
 
       - name: Round-trip a real pyarrow batch through the wheel
@@ -96,10 +117,22 @@ jobs:
           python tools/smoke.py
           python tools/metrics_smoke.py
 
+      # SHA256 checksums, so a downloaded wheel's integrity can be verified against
+      # what this workflow run actually produced. Not a substitute for a signature
+      # (nothing attests these checksums themselves), but a real, checkable link
+      # this project did not have before (docs/architecture.md Chapter XIX).
+      - name: Checksum the wheel
+        run: |
+          set -eux
+          cd crates/witchhat-py/dist
+          sha256sum *.whl | tee SHA256SUMS
+
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-manylinux-${{ matrix.arch }}
-          path: crates/witchhat-py/dist/*.whl
+          path: |
+            crates/witchhat-py/dist/*.whl
+            crates/witchhat-py/dist/SHA256SUMS
           if-no-files-found: error
 
   interpreters:
@@ -138,3 +171,32 @@ jobs:
           python -m pip install dist/*.whl pyarrow
           python -c "import witchhat, sys; print(sys.version); print(witchhat.__version__)"
           python tools/smoke.py
+
+  spark-integration:
+    name: witchhat.spark against a real local Spark session
+    runs-on: ubuntu-latest
+    needs: wheel
+    steps:
+      - uses: actions/checkout@v4
+      # JDK 17 is a stable, widely-used choice for local pyspark (also close to
+      # what recent Databricks Runtimes ship); tools/spark_smoke.py additionally
+      # sets the JVM --add-opens flags a newer JDK needs for Spark's bundled
+      # Arrow Java library, so this is not sensitive to the exact JDK version.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel-manylinux-x86_64
+          path: dist
+      - name: Install witchhat and pyspark
+        run: |
+          set -eux
+          python -m pip install --upgrade pip
+          python -m pip install dist/*.whl pyarrow pyspark
+      - name: Run witchhat.spark against a real local Spark session
+        run: python tools/spark_smoke.py

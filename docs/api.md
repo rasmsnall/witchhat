@@ -4,7 +4,7 @@
 **Status** Describes the surface as built: composite hashing, schema validation, JSON normalization, regex cleanup, output-equivalence testing, deduplication, join, aggregate, schema/CPU introspection, the `witchhat.spark` Databricks/Spark integration layer, and optional JSON metric logging.
 **Audience** Anyone calling this library from Python or from Rust.
 **Companion documents** `architecture.md` for why the design is shaped this way, `operations.md` for building and deploying it.
-**Version** 1.6
+**Version** 1.7
 **Date** 2026-09-16
 
 ---
@@ -411,15 +411,19 @@ Row-local, thin wrappers around `witchhat.clean_with_preset`/`clean_with_rules`.
 ### 5. `drop_duplicates`
 
 ```python
-wspark.drop_duplicates(df, columns, version="v1", repartition=True) -> DataFrame
+wspark.drop_duplicates(df, columns, version="v1", repartition=True, max_distinct_keys=None) -> DataFrame
 ```
 
-`witchhat.drop_duplicates` applied once per partition, after buffering that partition's
-batches into one (`mapInArrow` can hand back more than one batch per partition; applying
-the kernel to each separately could miss a duplicate split across two of them).
-`repartition=True` (default) calls `df.repartition(*columns)` first, which is what makes
-the result correct for the whole `DataFrame`, not just within whatever partition Spark
-happened to place each row in. See Section 9 below before passing `repartition=False`.
+`witchhat.drop_duplicates`'s logic applied across a whole partition, streamed: each
+incoming Arrow batch (`mapInArrow` can hand back more than one per partition) is hashed
+and filtered against a running per-partition index that persists across batches but
+never buffers a whole partition's raw rows into one `RecordBatch` first
+(`architecture.md` Chapter XVI, Section 2). `repartition=True` (default) calls
+`df.repartition(*columns)` first, which is what makes the result correct for the whole
+`DataFrame`, not just within whatever partition Spark happened to place each row in.
+`max_distinct_keys` (default `None`) raises `MemoryError` if a partition's distinct-key
+count would exceed it, guarding against an unexpectedly skewed partition. See Section 9
+below before passing `repartition=False`.
 
 ### 6. `aggregate`
 
@@ -427,10 +431,14 @@ happened to place each row in. See Section 9 below before passing `repartition=F
 wspark.aggregate(df, group_by, aggregations, repartition=True) -> DataFrame
 ```
 
-`witchhat.aggregate` applied once per partition, buffered the same way as
-`drop_duplicates`. `repartition=True` (default) calls `df.repartition(*group_by)` first.
-Unlike `witchhat.aggregate`, `group_by` must be non-empty: a whole-table aggregate needs
-every row in one partition, which hash-repartitioning cannot arrange, so this raises
+`witchhat.aggregate`'s logic applied across a whole partition, streamed: each batch is
+reduced independently and only a per-group merge state (one partial reduction per
+distinct group) persists across batches, not raw row data (`"mean"`/`"avg"` is
+requested as `sum`+`count` per batch and divided once at the end, since the mean of
+per-batch means is not the whole mean unless every batch is the same size).
+`repartition=True` (default) calls `df.repartition(*group_by)` first. Unlike
+`witchhat.aggregate`, `group_by` must be non-empty: a whole-table aggregate needs every
+row in one partition, which hash-repartitioning cannot arrange, so this raises
 `ValueError` instead of silently returning a partial answer.
 
 ### 7. `collect_as_record_batch`, `broadcast_join`

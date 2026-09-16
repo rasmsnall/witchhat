@@ -39,9 +39,16 @@ Every function below is optionally instrumented: call :func:`witchhat.metrics.en
 to have each one emit a JSON event (function name, row counts, duration, throughput) to
 a configurable sink. Disabled by default and effectively free when disabled; see
 :mod:`witchhat.metrics`.
+
+``witchhat.__commit__``/``witchhat.__built_at__`` name the exact source commit and
+build time a CI-built wheel came from (both ``None`` for a local dev build); see
+``witchhat._build_info`` and `docs/architecture.md` Chapter XIX for what this does and
+does not prove about provenance.
 """
 
 from . import metrics
+from ._build_info import BUILT_AT as __built_at__
+from ._build_info import COMMIT as __commit__
 from ._witchhat import (
     CpuFeatures,
     EquivalenceReport,
@@ -167,18 +174,27 @@ clean_with_rules.__doc__ = _clean_with_rules.__doc__
 
 
 def check_equivalence(
-    actual, expected, columns=None, allow_numeric_widening=False, hash_version="v1"
+    actual,
+    expected,
+    columns=None,
+    allow_numeric_widening=False,
+    hash_version="v1",
+    exact=False,
 ):
     if not metrics.is_enabled():
         return _check_equivalence(
-            actual, expected, columns, allow_numeric_widening, hash_version
+            actual, expected, columns, allow_numeric_widening, hash_version, exact
         )
-    with metrics.measure("check_equivalence", hash_version=hash_version) as event:
+    with metrics.measure(
+        "check_equivalence", hash_version=hash_version, exact=exact
+    ) as event:
         event["rows_in"] = metrics.row_count(actual)
         result = _check_equivalence(
-            actual, expected, columns, allow_numeric_widening, hash_version
+            actual, expected, columns, allow_numeric_widening, hash_version, exact
         )
         event["is_equivalent"] = result.is_equivalent()
+        if result.rows_exactly_match is not None:
+            event["rows_exactly_match"] = result.rows_exactly_match
         return result
 
 

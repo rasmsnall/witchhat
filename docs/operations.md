@@ -4,7 +4,7 @@
 **Status** Partial by necessity: witchhat is a stateless transformation library today, with no write path, no job to schedule, and no storage of its own. This document covers what already applies (build, install, sizing) and defers what does not yet (Chapter VI).
 **Audience** Whoever builds the wheel and installs it on a Databricks workspace.
 **Companion documents** `architecture.md` for the design, `api.md` for the callable surface.
-**Version** 1.7
+**Version** 1.8
 **Date** 2026-09-16
 
 ---
@@ -18,7 +18,8 @@
   - 1. Prerequisites
   - 2. Build command
   - 3. Verifying the wheel
-  - 4. Testing `witchhat.spark` locally
+  - 4. Testing `witchhat.spark` locally, and in CI
+  - 5. Benchmarking `witchhat.spark` against native Spark
 - III. Installing on Databricks
   - 1. From a Unity Catalog Volume
   - 2. From a package repository
@@ -111,17 +112,33 @@ matrix entry that built it. CI's `wheel` job asserts both and then imports the w
 exercises every exported function (`tools/smoke.py`) on the native runner that built
 it, before publishing it as an artifact.
 
-### 4. Testing `witchhat.spark` locally
+### 4. Testing `witchhat.spark` locally, and in CI
 
-`tools/spark_smoke.py` round-trips every `witchhat.spark` function against a real, local
-`pyspark` session (not part of CI: pyspark is a large, optional dependency, matching why
-`witchhat.spark` lazily imports it rather than requiring it). On a JDK 17+ machine, local
-Spark's bundled Arrow Java library can fail with `UnsupportedOperationException:
+`tools/spark_smoke.py` round-trips every `witchhat.spark` function, plus multiple Arrow
+batches within one partition, a skewed partition, null keys, an empty partition, and
+decimal aggregation, against a real, local `pyspark` session. Runnable locally, and (as
+of 2026-09-16) also runs in CI's own `spark-integration` job, separately from the main
+fmt/clippy/test/doc/wheel jobs since pyspark is a large, optional dependency, matching
+why `witchhat.spark` lazily imports it rather than requiring it. On a JDK 17+ machine,
+local Spark's bundled Arrow Java library can fail with `UnsupportedOperationException:
 sun.misc.Unsafe ... not available` on *any* Arrow-based Python UDF, before witchhat ever
 runs; this is a known pyspark/JDK compatibility gap, not a witchhat bug, does not affect
 Databricks (which manages its own JDK and Arrow versions), and `tools/spark_smoke.py`
 detects and explains it rather than failing with a bare Java stack trace. See the script's
-own module docstring for the JVM flags that resolve it on an affected machine.
+own module docstring for the JVM flags that resolve it on an affected machine, and CI's
+own `spark-integration` job for a JDK/pyspark combination confirmed to work without
+hitting it.
+
+### 5. Benchmarking `witchhat.spark` against native Spark
+
+`tools/spark_benchmark.py` times a complete Spark action (`.count()`, forcing full
+materialization) through `witchhat.spark` against Spark's own native operator, for
+`drop_duplicates` and `aggregate`, and prints both numbers plus the ratio. Not part of
+CI (it is a benchmark, not a pass/fail check, and its numbers are only meaningful read by
+a person against real hardware); run it manually with `--rows`/`--repeats` sized to the
+workload in question. See `docs/architecture.md` Chapter XIX, Section 2 for why this
+project does not claim a blanket "faster than Spark" result and what this script found
+on its own development sandbox.
 
 ## III. Installing on Databricks
 
@@ -213,12 +230,17 @@ rules, each rule is its own full pass over every value (`architecture.md` Chapte
 Section 1): fold rules that can be expressed as one pattern into one rule where
 practical, rather than chaining many small ones, if this becomes a measured bottleneck.
 
-### 6. Deduplication's extra cost is one `HashSet<u64>`
+### 6. Deduplication's extra cost is a hash bucket index, not just a `HashSet<u64>`
 
-`drop_duplicates` computes the same row hash `hash_rows` would, plus one `HashSet<u64>`
-sized to at most `batch.num_rows()` entries to track which hashes have already been
-seen. No second pass over the data beyond the `filter_record_batch` call that builds the
-output.
+`drop_duplicates` computes the same row hash `hash_rows` would, plus a
+`HashMap<u64, Vec<OwnedRow>>` tracking which exact rows have already been seen per hash
+bucket (`architecture.md` Chapter VIII): the hash alone decides which small bucket to
+compare a candidate row against, and `arrow_row::RowConverter` confirms exact equality
+within that bucket, so a `u64` collision between two distinct rows cannot silently drop
+a valid one. In the realistic case (few or no hash collisions) this costs about the same
+as the old plain `HashSet<u64>` approach; the exactness check only does real extra work
+when a bucket actually holds more than one distinct row. No second pass over the data
+beyond the `filter_record_batch` call that builds the output.
 
 ### 7. Join builds one index over the larger of its two inputs
 
@@ -236,16 +258,21 @@ each make one additional pass over every group's row indices per aggregation req
 so an `aggregate` call with many aggregation columns costs proportionally more, not just
 proportionally to `batch.num_rows()`.
 
-### 9. `witchhat.spark`'s partition-coordinating functions buffer a whole partition
+### 9. `witchhat.spark`'s partition-coordinating functions stream, not buffer
 
-`witchhat.spark.drop_duplicates`/`aggregate` (`architecture.md` Chapter XVI, Section 2)
-materialize every `RecordBatch` `mapInArrow` hands them for one partition into a single
-batch (`pyarrow.concat_batches`) before calling the underlying kernel, so peak memory per
-task is one partition's worth of data, not one Arrow batch's worth. Size Spark's
-partition count accordingly (more, smaller partitions if memory is tight) rather than
-assuming `spark.sql.execution.arrow.maxRecordsPerBatch` alone bounds memory here, the way
-it would for a row-local `witchhat.spark` function. `repartition=True` (the default on
-both) adds a shuffle before this, the same cost `df.repartition(...)` always has.
+`witchhat.spark.drop_duplicates`/`aggregate` (`architecture.md` Chapter XVI, Section 2,
+rewritten 2026-09-16) no longer materialize every `RecordBatch` `mapInArrow` hands them
+for one partition into a single buffered batch first. Instead, each incoming batch is
+processed as it arrives and only a running per-partition state persists across batches:
+for `drop_duplicates`, a `{hash: [seen keys]}` index (memory tracks the number of
+*distinct keys* seen so far, not the partition's row count, and `max_distinct_keys`
+bounds it explicitly); for `aggregate`, one partial-reduction entry per *distinct
+group* (memory tracks group cardinality, not row count; a `group_by` with as many
+distinct values as rows does not benefit from this the way a low-cardinality one does).
+Size Spark's partition count for the *distinct key/group cardinality* you expect per
+partition, not the row count, which is the opposite of the old buffer-the-whole-
+partition sizing advice. `repartition=True` (the default on both) still adds a shuffle
+before this, the same cost `df.repartition(...)` always has.
 
 ### 10. Metric logging is free when off, and one JSON encode per call when on
 
@@ -270,6 +297,10 @@ cross-task aggregation to coordinate (Chapter VI, Section 1's monitoring note, a
 | `ValueError: unknown hash version ...` | A typo in `version`, or code written against a version this build does not implement | Check `witchhat.__version__` and this build's supported versions |
 | `RuntimeError: column "..." not found in schema` | A column name mismatch, often from a schema that drifted upstream | Compare the caller's expected columns against `batch.schema` |
 | `RuntimeError: unsupported arrow type for this operation: ...` | A column of a type Table 3-2 in `architecture.md` does not list | Cast the column, or wait for that type to be added |
+| `RuntimeError: numeric overflow: ...` | `aggregate`'s exact `"sum"`/`"mean"` accumulator (`i128`/`u128`/decimal mantissa) could not represent a group's running total | The group's true total genuinely does not fit; there is no `f64` fallback to silently lose precision instead |
+| `ValueError: broadcast_join does not support how="right"/"full"` | `wspark.broadcast_join` was called with an unsound `how` (`architecture.md` Chapter XVI, Section 5) | Use `"inner"`/`"left"`, or `DataFrame.join` for genuine right/full semantics |
+| `MemoryError: ... exceeded max_distinct_keys=...` | `wspark.drop_duplicates`'s `max_distinct_keys` guard tripped on a partition more skewed than expected | Raise the limit, repartition more finely, or investigate the skew itself |
+| `pyo3_runtime.PanicException` | An unexpected Rust panic inside a kernel (a bug, not a documented failure mode; `witchhat-core` is designed not to panic on any input) | Report it; the release profile no longer sets `panic = "abort"`, so this is now catchable instead of killing the worker (`architecture.md` Chapter XIII) |
 
 `validate_schema` and `normalize_json` are not in this table: a schema mismatch is a
 normal `SchemaDiff` return value and a malformed JSON row is a normal, counted null in

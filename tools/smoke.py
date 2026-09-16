@@ -112,8 +112,20 @@ def main() -> int:
 
     report = witchhat.check_equivalence(reordered, batch)
     assert report.is_equivalent(), report
+    assert report.rows_exactly_match is None  # fast mode (default): not computed
     different = witchhat.check_equivalence(batch, pa.record_batch({"id": pa.array([9])}))
     assert not different.is_equivalent()
+
+    exact_report = witchhat.check_equivalence(reordered, batch, exact=True)
+    assert exact_report.rows_exactly_match is True
+    assert exact_report.is_equivalent()
+    exact_mismatch = witchhat.check_equivalence(
+        pa.record_batch({"id": pa.array([1, 2])}),
+        pa.record_batch({"id": pa.array([1, 3])}),
+        exact=True,
+    )
+    assert exact_mismatch.rows_exactly_match is False
+    assert not exact_mismatch.is_equivalent()
 
     dup_batch = pa.record_batch({"id": pa.array([1, 2, 1, 3, 2])})
     deduped = witchhat.drop_duplicates(dup_batch, ["id"])

@@ -364,11 +364,17 @@ class EquivalenceReport:
 
     @property
     def fingerprints_match(self) -> bool: ...
+    @property
+    def rows_exactly_match(self) -> bool | None:
+        """Whether the sorted rows compared exactly equal, with no
+        fingerprint-collision caveat. ``None`` unless ``check_equivalence`` was called
+        with ``exact=True``."""
+
     def is_equivalent(self) -> bool:
         """Whether the two batches are equivalent: empty schema diff, matching row
-        counts, and matching table fingerprints. Stricter than
-        ``schema_diff.is_breaking()``: an extra column alone fails this, unlike a
-        breaking-change check."""
+        counts, matching table fingerprints, and (when ``exact=True`` was passed)
+        matching sorted rows. Stricter than ``schema_diff.is_breaking()``: an extra
+        column alone fails this, unlike a breaking-change check."""
 
 def check_equivalence(
     actual: _ArrowArrayExportable,
@@ -376,6 +382,7 @@ def check_equivalence(
     columns: list[str] | None = None,
     allow_numeric_widening: bool = False,
     hash_version: str = "v1",
+    exact: bool = False,
 ) -> EquivalenceReport:
     """Compare ``actual`` against ``expected``: same schema, same row count, same
     rows regardless of order.
@@ -393,6 +400,12 @@ def check_equivalence(
         Passed through to the schema comparison; see :func:`validate_schema`.
     hash_version:
         The row-hashing algorithm to use, by name.
+    exact:
+        ``False`` (default) checks fingerprints only: strong evidence, not proof, since
+        a ``u64`` collision between different row sets is possible however unlikely.
+        ``True`` additionally sorts both sides' rows and compares them element-wise, a
+        real proof of row-set equality, at the cost of sorting both sides. Use ``True``
+        when a check must be relied on, e.g. gating a migration.
 
     Returns
     -------

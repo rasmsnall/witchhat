@@ -4,7 +4,7 @@
 **Status** Eight kernels (composite hashing, schema validation, JSON normalization, regex cleanup, output-equivalence testing, deduplication, join, aggregate) are implemented end to end, behind both the Rust and the Python surface, plus a Spark/Databricks integration layer (Chapter XVI) and optional JSON metric logging (Chapter XVII). Filter and project need no witchhat-specific kernel (Arrow's own compute kernels already cover them); see Chapter XX for what remains.
 **Audience** Anyone integrating, operating, or extending this library. No prior context assumed.
 **Companion documents** `api.md` for the callable surface, `operations.md` for building and deploying it.
-**Version** 1.7
+**Version** 1.8
 **Date** 2026-09-16
 
 ---
@@ -113,7 +113,12 @@ witchhat is a Rust core, exposed to Python via PyO3, aimed at Spark and Databric
 workloads: replacing Spark-native transformations (composite hashing, schema validation,
 JSON normalization, regex-heavy cleanup, join, aggregate) with native kernels that run an
 order of magnitude faster on a single node, while staying comparable to Spark's own
-output.
+output. That single-node claim is specifically about the kernel's own throughput versus
+a generic per-row UDF doing the same work, not a claim that calling it through
+`mapInArrow` beats Spark's own built-in operator end to end: JVM/Arrow conversion and
+`mapInArrow`'s own overhead are real costs a native Spark operator does not pay at all,
+and `tools/spark_benchmark.py` measures exactly that gap honestly (Chapter XIX, Section
+2) rather than assuming it away.
 
 ### 2. Rationale
 
@@ -641,20 +646,33 @@ CPU-bound kernel is in flight instead of blocking on it.
 ## XIII. Failure Model
 
 `witchhat-core` returns `Result<T, witchhat_core::Error>` from every fallible function;
-nothing panics on a caller-supplied input. `Error` has five variants: `UnknownColumn`,
-`TypeMismatch` (used directly by `join`'s key-type check, Chapter IX) and
-`UnsupportedType` (a column cannot be processed), `SchemaMismatch` (wraps an
+nothing panics on a caller-supplied input by design. `Error` has six variants:
+`UnknownColumn`, `TypeMismatch` (used directly by `join`'s key-type check, Chapter IX)
+and `UnsupportedType` (a column cannot be processed), `SchemaMismatch` (wraps an
 `arrow_select`/`RecordBatch::try_new` failure from `dedup`, `join` or `aggregate`'s
-output construction), and `Config` (an invalid argument: an unrecognised cleanup preset
-name, a regex that does not compile, or `join`'s key-list length/emptiness check).
-`validate_schema` and `normalize_json`'s row-level problems are deliberately *not*
-`Error`: an unequal schema is a normal `SchemaDiff`, and a malformed JSON row is a
-normal, counted null, not a failure of the whole batch (Chapter V, Section 2) — only a
-structural problem that makes the *call itself* impossible (an unsupported target type,
-an unknown column, mismatched join key types) is an `Error`. At the Python boundary,
-every `Error` variant becomes a `RuntimeError` except an unrecognised version/preset/
-join-type/aggregate-function name, which is raised as `ValueError`, matching Python's
-own convention.
+output construction), `Config` (an invalid argument: an unrecognised cleanup preset
+name, a regex that does not compile, or `join`'s key-list length/emptiness check), and
+`Overflow` (`aggregate`'s exact `Sum`/`Mean` accumulator cannot represent a group's
+running total, Chapter X Section 3). `validate_schema` and `normalize_json`'s row-level
+problems are deliberately *not* `Error`: an unequal schema is a normal `SchemaDiff`, and
+a malformed JSON row is a normal, counted null, not a failure of the whole batch
+(Chapter V, Section 2) — only a structural problem that makes the *call itself*
+impossible (an unsupported target type, an unknown column, mismatched join key types) is
+an `Error`. At the Python boundary, every `Error` variant becomes a `RuntimeError` except
+an unrecognised version/preset/join-type/aggregate-function name, which is raised as
+`ValueError`, matching Python's own convention.
+
+Belt-and-suspenders for the "nothing panics by design" claim above: a panic that
+happens anyway (an internal bug, not a documented failure mode) does not take down the
+whole Python process. `witchhat-py`'s release profile does not set `panic = "abort"`
+(a 2026-09-16 fix; it briefly did, inherited from the initial workspace scaffold) —
+PyO3 already wraps every `#[pyfunction]`/`#[pymethods]` call in `std::panic::catch_unwind`
+(`pyo3::impl_::trampoline`), converting a caught panic into a catchable
+`pyo3_runtime.PanicException` instead of letting it propagate through the FFI boundary,
+but only under unwind semantics: `panic = "abort"` calls `process::abort()` immediately
+on any panic, before `catch_unwind` ever runs, so it silently defeated PyO3's own safety
+net. Verified directly: a deliberately panicking `#[pyfunction]`, called from Python
+after removing `panic = "abort"`, raises `PanicException` and the interpreter survives.
 
 ## XIV. Security Model
 
@@ -913,6 +931,19 @@ Pinned 2026-09 (probed via `cargo build`; crates.io index reachable): `arrow 56.
   logs a traceback that could quote row-derived values (Chapter XVII, Section 3).
 - No `unsafe` in this crate's own code; the dependency surface is small and each
   dependency's role is documented (Chapter XVIII).
+- `witchhat.spark.drop_duplicates`/`aggregate` stream per Arrow batch (a running
+  per-partition index/merge state), not a whole buffered partition, with
+  `max_distinct_keys` guarding `drop_duplicates` against an unexpectedly skewed
+  partition instead of letting it grow without bound (Chapter XVI, Section 2).
+- `check_equivalence` offers a real `Exact` mode (a genuine sorted-row comparison, no
+  fingerprint-collision caveat) alongside the still-default `Fast` fingerprint check,
+  so a caller chooses the strength of proof a given comparison needs (Chapter VII).
+- A Rust panic in a kernel raises a catchable Python exception instead of aborting the
+  whole worker process, since the release profile no longer defeats PyO3's own
+  panic-to-exception machinery (Chapter XIII).
+- A release wheel carries a commit-SHA stamp and a checksum file, so a downloaded wheel
+  is traceable to the exact source it was built from, not just a version number
+  (Chapter XVIII).
 
 ### 2. Disadvantages
 
@@ -939,6 +970,21 @@ Pinned 2026-09 (probed via `cargo build`; crates.io index reachable): `arrow 56.
 - Metric logging has no built-in cross-executor aggregation; a distributed job's events
   land wherever each partition's task ran unless the caller supplies a sink that
   collects them itself (Chapter XVII, Section 4).
+- `witchhat_core::clean`'s `regex` dialect is not Spark/Java's: lookaround and
+  backreferences in a pattern are rejected outright, and there is no automated check of
+  a given pattern's behaviour against Spark's own regex engine, only documentation of
+  the gap (Chapter VI).
+- Measured, not assumed: `tools/spark_benchmark.py` found `witchhat.spark`'s
+  `mapInArrow` path 5.8x-7.6x *slower* than Spark's own native `dropDuplicates`/
+  `groupBy().agg()` on this project's `local[2]` sandbox at 50k rows, driven by
+  JVM/Arrow conversion and `mapInArrow` overhead, not kernel speed. Single-node kernel
+  throughput (Chapter I) is not the same claim as "faster than Spark end to end", and
+  this project does not make the latter claim; rerun the benchmark on real hardware
+  before drawing a conclusion for a specific workload, and expect the crossover point
+  (if any) to depend heavily on row count and the operation's own cost.
+- No SBOM or cryptographic signature on a release wheel yet, only a commit-SHA stamp
+  and a checksum file; both need infrastructure (a signing key/OIDC identity, an SBOM
+  generator) not yet provisioned (Chapter XVIII).
 
 ### 3. Conditions under which this design is inappropriate
 
@@ -973,30 +1019,42 @@ unsound under per-partition broadcast), optional JSON metric logging (`witchhat.
 Chapter XVII, instrumenting `witchhat.spark` transitively), the `abi3-py310` wheel build
 now cross-built for both `x86_64` and `aarch64` (Graviton) manylinux targets.
 
-An external code review (2026-09-16) found the five correctness gaps just listed
-(deduplication collision risk, join null semantics, aggregate `f64` precision,
-`broadcast_join` right/full unsoundness, GIL retention) in code that had previously only
-documented them as caveats; all five are now fixed, not just documented. The same review
-raised several lower-priority items not yet acted on: whole Spark partitions are
-buffered in memory rather than streamed (Chapter XVI, Section 2); `check_equivalence` is
-fingerprint-only, with no schema-plus-exact-row-comparison mode; the `regex` crate's
-syntax is not Spark/Java regex syntax and the gap is undocumented; no benchmark proves a
-Spark-side win net of JVM/Arrow conversion overhead; `witchhat.spark`/`mapInArrow` has no
-CI coverage, only the manual `tools/spark_smoke.py`; the release profile's
-`panic = "abort"` means an unexpected Rust panic still kills the whole Python worker
-instead of raising a catchable exception; wheels carry no provenance (checksums, source
-commit SHA, SBOM, signing) tying them to the source they were built from.
+An external code review (2026-09-16) found twelve issues in code that had, at the time,
+either a correctness gap or only a documented caveat rather than a fix. All twelve were
+addressed the same day. Five were the highest-priority correctness gaps just listed
+above (deduplication collision risk, join null semantics, aggregate `f64` precision,
+`broadcast_join` right/full unsoundness, GIL retention). The other seven, lower
+priority, also fixed the same day: `witchhat.spark.drop_duplicates`/`aggregate` now
+stream per Arrow batch (a running per-partition index/merge state) instead of buffering
+a whole partition first, with a new `max_distinct_keys` bound guarding
+`drop_duplicates` against an unexpectedly skewed partition (Chapter XVI, Section 2);
+`check_equivalence` gained a real `Exact` mode (Chapter VII) alongside the original
+fingerprint-only `Fast` default; `witchhat_core::clean`'s docs now explain the
+Rust-`regex`-versus-Spark/Java-regex dialect gap explicitly, with lookaround/
+backreference rejection covered by a test (Chapter VI); `tools/spark_benchmark.py`
+times a complete Spark action honestly, and on this project's own local sandbox found
+witchhat's `mapInArrow` path measurably *slower* than Spark's native operators at
+moderate row counts, a real, unflattering, and now-visible number, not something the
+script exists to explain away (Chapter XIX); a new `spark-integration` CI job runs
+`tools/spark_smoke.py` (itself extended the same day: multiple Arrow batches per
+partition, a skewed partition, null keys, an empty partition, decimal aggregation)
+against a real local Spark session; the release profile no longer sets
+`panic = "abort"`, so PyO3's own existing panic-to-exception machinery (previously
+silently defeated by it) works again (Chapter XIII); and a release wheel now carries a
+commit-SHA stamp and a `SHA256SUMS` file, though not yet a full SBOM or a cryptographic
+signature, which need infrastructure (a signing key/OIDC identity, an SBOM generator)
+not yet provisioned (Chapter XIX).
 
 Publishing to a package repository and verifying installation from a Unity Catalog
 Volume against a live workspace were both raised and then deliberately decided against
 pursuing further (2026-09-16): the project stays wheel-only, and the Volumes install
 path is documented as the standard, sufficient procedure rather than something this
 repository additionally verifies live; see `docs/operations.md` Chapter VI, Section 2
-for the reasoning. Still open: broader `aggregate` type support (Section 2 above), and
-array-valued/deeper-nested JSON (Chapter V, Section 3). See the repository `README.md`
-for the up-to-date backlog; this document describes the architecture of what exists, and
-is expected to gain chapters as each item lands rather than being rewritten from
-scratch.
+for the reasoning. Still open: broader `aggregate` type support (Section 2 above),
+array-valued/deeper-nested JSON (Chapter V, Section 3), and a full SBOM/signed release
+artifact (above). See the repository `README.md` for the up-to-date backlog; this
+document describes the architecture of what exists, and is expected to gain chapters as
+each item lands rather than being rewritten from scratch.
 
 ## References
 

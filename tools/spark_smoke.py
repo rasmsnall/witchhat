@@ -5,11 +5,14 @@ Run after installing the wheel and pyspark (see docs/operations.md):
     pip install pyspark
     python tools/spark_smoke.py
 
-Not part of the wheel's own CI (pyspark is a large, optional dependency; see
-witchhat.spark's module docstring for why it is lazily imported rather than
-required), but exercises every function in witchhat.spark against a real local
-Spark session, the same role tools/smoke.py plays for the core package against
-real pyarrow.
+Runs in CI too (the `spark-integration` job in `.github/workflows/ci.yml`,
+added 2026-09-16), separately from the main fmt/clippy/test/doc/wheel jobs
+since pyspark is a large, optional dependency (see witchhat.spark's module
+docstring for why it is lazily imported rather than required). Exercises
+every function in witchhat.spark against a real local Spark session, the same
+role tools/smoke.py plays for the core package against real pyarrow, plus
+(run_streaming_coverage below) multiple Arrow batches within one partition, a
+skewed partition, null keys, an empty partition, and decimal aggregation.
 
 On a JDK 17+ machine, local Spark's bundled Arrow Java library can fail with
 `UnsupportedOperationException: sun.misc.Unsafe ... not available` on *any*
@@ -166,6 +169,119 @@ def run(spark) -> None:
     assert isinstance(fp, int)
     diff = wspark.validate_schema(df, df)
     assert diff.is_empty()
+
+    run_streaming_coverage(spark)
+
+
+def run_streaming_coverage(spark) -> None:
+    """Exercises what the 2026-09-16 review round asked for specifically:
+    multiple Arrow batches within one partition (the streaming rewrite's whole
+    point), a skewed partition, null keys, an empty partition, and a decimal
+    column, none of which the smaller dataset above forces on its own.
+    """
+    from decimal import Decimal
+
+    from pyspark.sql.types import DecimalType, StringType, StructField, StructType
+
+    # Force small Arrow batches so a single Spark partition still hands
+    # mapInArrow more than one RecordBatch: this is the only way to actually
+    # exercise cross-batch state (drop_duplicates's "seen" index,
+    # aggregate's per-group merge), which a single default-sized batch would
+    # never touch even if the merge logic were wrong.
+    spark.conf.set("spark.sql.execution.arrow.maxRecordsPerBatch", "4")
+    try:
+        # multiple batches + skew + nulls: one partition (coalesce(1)), enough
+        # rows to span several 4-row Arrow batches, id=1 heavily duplicated
+        # (skew), one row with a null key.
+        rows = [(1, "a")] * 15 + [(2, "b")] * 3 + [(None, "n")]
+        skewed = spark.createDataFrame(rows, ["id", "name"]).coalesce(1)
+        deduped = wspark.drop_duplicates(skewed, ["id", "name"], repartition=False)
+        result = {(r["id"], r["name"]) for r in deduped.collect()}
+        # first-occurrence survivors: one (1,"a"), one (2,"b"), the null row
+        # (null keys are their own kind of value here, not skipped)
+        assert result == {(1, "a"), (2, "b"), (None, "n")}, result
+
+        # max_distinct_keys trips on a partition more skewed than expected,
+        # rather than growing its "seen" index without bound.
+        try:
+            wspark.drop_duplicates(
+                skewed, ["id", "name"], repartition=False, max_distinct_keys=1
+            ).collect()
+        except Exception as exc:  # Spark wraps the executor-side exception
+            assert "max_distinct_keys" in str(exc), exc
+        else:
+            raise AssertionError("expected max_distinct_keys to raise")
+
+        # aggregate across multiple batches: sum/count/mean/min/max must merge
+        # correctly across every 4-row Arrow batch, not just be right per batch.
+        # Mean in particular is wrong if batches are naively averaged instead of
+        # weighted by (sum, count): batch 1 (rows 1-4, all group "a", values
+        # 1..4) has mean 2.5; batch 2 continues group "a" with more rows. A
+        # naive mean-of-batch-means would not equal the true whole-group mean
+        # whenever batch sizes/contributions differ, which this 19-row,
+        # 4-per-batch layout guarantees.
+        amounts = [(("a" if i % 3 else "b"), i) for i in range(1, 20)]
+        amt_df = spark.createDataFrame(amounts, ["grp", "amount"]).coalesce(1)
+        agg = wspark.aggregate(
+            amt_df,
+            ["grp"],
+            [
+                ("amount", "sum", "total"),
+                ("amount", "count", "n"),
+                ("amount", "mean", "avg"),
+                ("amount", "min", "lo"),
+                ("amount", "max", "hi"),
+            ],
+        )
+        by_group = {r["grp"]: r for r in agg.collect()}
+        expected_a = [i for i in range(1, 20) if i % 3]
+        expected_b = [i for i in range(1, 20) if not i % 3]
+        assert by_group["a"]["total"] == sum(expected_a)
+        assert by_group["a"]["n"] == len(expected_a)
+        assert by_group["a"]["avg"] == sum(expected_a) / len(expected_a)
+        assert by_group["a"]["lo"] == min(expected_a)
+        assert by_group["a"]["hi"] == max(expected_a)
+        assert by_group["b"]["total"] == sum(expected_b)
+        assert by_group["b"]["avg"] == sum(expected_b) / len(expected_b)
+
+        # decimal aggregation, streamed across multiple batches: exact mantissa
+        # summation must still hold when merged across batches, not just within
+        # one witchhat.aggregate call.
+        decimal_schema = StructType(
+            [
+                StructField("grp", StringType(), False),
+                StructField("amount", DecimalType(20, 2), False),
+            ]
+        )
+        decimal_rows = [("x", Decimal(f"{i}.50")) for i in range(1, 11)]
+        decimal_df = spark.createDataFrame(decimal_rows, decimal_schema).coalesce(1)
+        decimal_agg = wspark.aggregate(
+            decimal_df, ["grp"], [("amount", "sum", "total"), ("amount", "mean", "avg")]
+        )
+        decimal_row = decimal_agg.collect()[0]
+        assert decimal_row["total"] == sum((Decimal(f"{i}.50") for i in range(1, 11)), Decimal(0))
+        assert decimal_row["avg"] == decimal_row["total"] / 10
+
+        # an empty partition (more partitions than rows) must not error, and
+        # must simply contribute nothing.
+        tiny = spark.createDataFrame([(1, "a")], ["id", "name"]).repartition(8)
+        assert wspark.drop_duplicates(tiny, ["id", "name"], repartition=False).count() == 1
+        assert (
+            wspark.aggregate(tiny, ["name"], [("id", "sum", "total")], repartition=False)
+            .count()
+            == 1
+        )
+
+        # a real end-to-end equivalence check between witchhat.spark's output and
+        # an independently-built expected pyarrow batch, exact mode (item 7).
+        expected = pa.record_batch(
+            {"id": pa.array([1, 2, None], type=pa.int64()), "name": pa.array(["a", "b", "n"])}
+        )
+        actual = wspark.collect_as_record_batch(deduped)
+        report = witchhat.check_equivalence(actual, expected, exact=True)
+        assert report.is_equivalent(), report
+    finally:
+        spark.conf.unset("spark.sql.execution.arrow.maxRecordsPerBatch")
 
 
 if __name__ == "__main__":

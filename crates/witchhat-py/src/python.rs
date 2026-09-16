@@ -371,25 +371,32 @@ struct PyEquivalenceReport {
     /// Whether the two table fingerprints matched.
     #[pyo3(get)]
     fingerprints_match: bool,
+    /// Whether the sorted rows compared exactly equal, with no fingerprint-collision
+    /// caveat. `None` unless `check_equivalence` was called with `exact=True`.
+    #[pyo3(get)]
+    rows_exactly_match: Option<bool>,
 }
 
 #[pymethods]
 impl PyEquivalenceReport {
     /// Whether `actual` and `expected` are equivalent: empty schema diff, matching row
-    /// counts, and matching table fingerprints.
+    /// counts, matching table fingerprints, and (when `exact=True` was passed) matching
+    /// sorted rows.
     fn is_equivalent(&self) -> bool {
         self.schema_diff.is_empty()
             && self.row_count_actual == self.row_count_expected
             && self.fingerprints_match
+            && self.rows_exactly_match.unwrap_or(true)
     }
 
     fn __repr__(&self) -> String {
         format!(
-            "EquivalenceReport(is_equivalent={}, row_count_actual={}, row_count_expected={}, fingerprints_match={})",
+            "EquivalenceReport(is_equivalent={}, row_count_actual={}, row_count_expected={}, fingerprints_match={}, rows_exactly_match={:?})",
             self.is_equivalent(),
             self.row_count_actual,
             self.row_count_expected,
-            self.fingerprints_match
+            self.fingerprints_match,
+            self.rows_exactly_match,
         )
     }
 }
@@ -401,10 +408,13 @@ impl PyEquivalenceReport {
 /// default) uses every column `expected` and `actual` have in common, in `expected`'s
 /// order, so a column declared in a different position on each side does not by itself
 /// cause a mismatch. `allow_numeric_widening` is passed through to the schema
-/// comparison. Raises `RuntimeError` for an unknown column or an unsupported column
-/// type, and `ValueError` for an unrecognised `hash_version`.
+/// comparison. `exact` (default `False`) additionally sorts both sides' rows and
+/// compares them element-wise, a real proof of row-set equality rather than the
+/// fingerprint's collision-caveated evidence; use it when a check must be relied on,
+/// e.g. gating a migration. Raises `RuntimeError` for an unknown column or an
+/// unsupported column type, and `ValueError` for an unrecognised `hash_version`.
 #[pyfunction]
-#[pyo3(signature = (actual, expected, columns = None, allow_numeric_widening = false, hash_version = "v1"))]
+#[pyo3(signature = (actual, expected, columns = None, allow_numeric_widening = false, hash_version = "v1", exact = false))]
 fn check_equivalence(
     py: Python<'_>,
     actual: PyArrowType<RecordBatch>,
@@ -412,6 +422,7 @@ fn check_equivalence(
     columns: Option<Vec<String>>,
     allow_numeric_widening: bool,
     hash_version: &str,
+    exact: bool,
 ) -> PyResult<PyEquivalenceReport> {
     let version = parse_version(hash_version)?;
     let options = witchhat_core::EquivalenceOptions {
@@ -419,6 +430,11 @@ fn check_equivalence(
         hash_version: version,
         schema_options: ValidateSchemaOptions {
             allow_numeric_widening,
+        },
+        mode: if exact {
+            witchhat_core::EquivalenceMode::Exact
+        } else {
+            witchhat_core::EquivalenceMode::Fast
         },
     };
     let report = py
@@ -431,6 +447,7 @@ fn check_equivalence(
         table_fingerprint_actual: report.table_fingerprint_actual,
         table_fingerprint_expected: report.table_fingerprint_expected,
         fingerprints_match: report.fingerprints_match,
+        rows_exactly_match: report.rows_exactly_match,
     })
 }
 

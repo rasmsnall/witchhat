@@ -241,19 +241,41 @@ Type hints and generated docs (`.pyi` stubs, `py.typed`, `docs/*.md` + generated
 
 An external (Codex) code review on 2026-09-16 found real correctness issues in code that
 was already implemented and, until then, only documented as a caveat rather than fixed.
-All five highest-priority findings were fixed the same day: `drop_duplicates` no longer
-treats a hash collision as row equality (falls back to an exact `arrow_row` comparison
-within a hash bucket); `join` excludes null keys from matching by default, the same as
-Spark, with the new `join_null_safe` as an explicit opt-in for null-matches-null;
-`aggregate`'s `Sum`/`Mean`/`Min`/`Max` accumulate and compare at each numeric column's
-own exact precision (`i128`/`u128`/native decimal mantissa, plus new `Decimal128`/
-`Decimal256` support) instead of downcasting through `f64`; `witchhat.spark.broadcast_join`
-now rejects `how="right"`/`"full"` outright instead of merely documenting why they were
-unsound; and every PyO3-bound kernel call now releases the GIL for its duration. See
-`CLAUDE.md`'s "Open items" for exactly what changed in each case, plus the lower-priority
-findings from the same review that are not yet acted on (partition memory buffering,
-`check_equivalence` exactness, Rust-vs-Spark regex dialect, unproven Spark performance
-claims, no Spark integration CI, `panic = "abort"` worker safety, artifact provenance).
+All twelve findings were addressed the same day (five highest-priority, then seven
+lower-priority):
+
+- `drop_duplicates` no longer treats a hash collision as row equality (falls back to an
+  exact `arrow_row` comparison within a hash bucket).
+- `join` excludes null keys from matching by default, the same as Spark, with the new
+  `join_null_safe` as an explicit opt-in for null-matches-null.
+- `aggregate`'s `Sum`/`Mean`/`Min`/`Max` accumulate and compare at each numeric column's
+  own exact precision (`i128`/`u128`/native decimal mantissa, plus new `Decimal128`/
+  `Decimal256` support) instead of downcasting through `f64`.
+- `witchhat.spark.broadcast_join` rejects `how="right"`/`"full"` outright instead of
+  merely documenting why they were unsound.
+- Every PyO3-bound kernel call releases the GIL for its duration.
+- `witchhat.spark.drop_duplicates`/`aggregate` stream per Arrow batch instead of
+  buffering a whole partition first (a new `max_distinct_keys` guards `drop_duplicates`
+  against unbounded growth on a skewed partition).
+- `check_equivalence` gained a real `exact` mode: a genuine sorted-row comparison, not
+  just a fingerprint, via `EquivalenceReport.rows_exactly_match`.
+- The Rust-`regex`-versus-Spark/Java-regex dialect gap is now documented explicitly
+  (`witchhat_core::clean`'s docs), with a test confirming lookaround/backreferences are
+  rejected at compile time, not silently different.
+- `tools/spark_benchmark.py` (new) times a complete Spark action through `witchhat.spark`
+  against Spark's own native operator and prints both numbers honestly; on this local
+  sandbox witchhat's `mapInArrow` path was measurably *slower*, driven by JVM/Arrow
+  conversion overhead, not kernel speed, which the script exists to surface, not hide.
+- `witchhat.spark`/`mapInArrow` now has real CI coverage (a `spark-integration` job).
+- Root `Cargo.toml` no longer sets `panic = "abort"`, so a Rust panic raises a catchable
+  Python exception instead of killing the whole worker (PyO3 already had the machinery
+  for this; the release profile was silently defeating it).
+- Wheels now carry a commit-SHA stamp (`witchhat.__commit__`) and a `SHA256SUMS` file;
+  a full SBOM and a cryptographic signature are **not** done, and not claimed as done,
+  since both need infrastructure (a signing key/OIDC identity, an SBOM generator) this
+  project has not provisioned.
+
+See `CLAUDE.md`'s "Open items" for exactly what changed in each case.
 
 ## Tests
 
@@ -261,15 +283,16 @@ claims, no Spark integration CI, `panic = "abort"` worker safety, artifact prove
 cargo test --workspace
 ```
 
-76 unit tests plus 15 doctests, all in `witchhat-core`, covering: hash determinism,
+81 unit tests plus 15 doctests, all in `witchhat-core`, covering: hash determinism,
 column-order sensitivity, null-vs-value distinctness, type-tag collision avoidance
 (including the Date/Time/Timestamp/Decimal types added alongside join/aggregate), float
 canonicalization; schema-diff correctness (missing/unexpected/retyped/nullability,
 numeric widening opt-in); JSON normalization (malformed rows, type mismatches, absent
 vs. explicit-null, nested-path extraction); regex cleanup (every built-in preset, rule
-ordering, invalid-pattern rejection); output equivalence (identical, reordered,
-different-value, different-row-count, column-order-independent, explicit-column-subset
-batches); deduplication (first-occurrence order, composite keys, unknown columns); join
+ordering, invalid-pattern rejection, lookaround/backreference rejection); output
+equivalence (identical, reordered, different-value, different-row-count,
+column-order-independent, explicit-column-subset batches, fast-versus-exact mode);
+deduplication (first-occurrence order, composite keys, unknown columns); join
 (inner/left/right/full, composite keys, name-collision suffixing, key-type mismatch,
 null-key exclusion versus `join_null_safe`); and aggregate (sum/count/min/max per group,
 exact numeric precision beyond `f64`'s ±2^53 range, `Decimal128` type preservation,

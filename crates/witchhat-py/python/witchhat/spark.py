@@ -31,11 +31,15 @@ DataFrame:
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Iterable, Iterator
 
 import pyarrow as pa
 
 import witchhat as _witchhat
+from . import metrics
+from ._witchhat import aggregate as _raw_aggregate
+from ._witchhat import hash_rows as _raw_hash_rows
 
 if TYPE_CHECKING:
     from pyspark.sql import DataFrame
@@ -228,14 +232,64 @@ def clean_with_rules(
     return map_in_arrow(df, process, out_schema)
 
 
+def _drop_duplicates_stream(
+    batches: Iterator[pa.RecordBatch],
+    columns: list[str],
+    version: str,
+    max_distinct_keys: int | None,
+    stats: dict[str, int],
+) -> Iterator[pa.RecordBatch]:
+    # {hash: [distinct key tuples already seen with that hash]}, mirroring
+    # witchhat.drop_duplicates's own collision-safe bucket-then-exact-compare
+    # design (docs/architecture.md Chapter VIII): the hash narrows which bucket a
+    # new row is compared against, it never decides equality by itself. Persists
+    # across every batch in the partition, but never holds a whole batch's raw row
+    # data the way buffering the partition into one RecordBatch first would.
+    seen: dict[int, list[tuple]] = {}
+    for batch in batches:
+        stats["batches_in"] += 1
+        n = batch.num_rows
+        if n == 0:
+            continue
+        stats["rows_in"] += n
+        hashes = _raw_hash_rows(batch, columns, version).to_pylist()
+        key_columns = [batch.column(c).to_pylist() for c in columns]
+        keep = [False] * n
+        for i in range(n):
+            key = tuple(col[i] for col in key_columns)
+            bucket = seen.get(hashes[i])
+            if bucket is None:
+                seen[hashes[i]] = [key]
+                keep[i] = True
+            elif key in bucket:
+                keep[i] = False
+            else:
+                bucket.append(key)
+                keep[i] = True
+        stats["distinct_keys"] = len(seen)
+        if max_distinct_keys is not None and len(seen) > max_distinct_keys:
+            raise MemoryError(
+                "witchhat.spark.drop_duplicates: partition exceeded "
+                f"max_distinct_keys={max_distinct_keys} (tracking {len(seen)} "
+                "distinct keys so far); this partition's key distribution is more "
+                "skewed than expected."
+            )
+        out = batch.filter(pa.array(keep, type=pa.bool_()))
+        stats["rows_out"] += out.num_rows
+        yield out
+
+
 def drop_duplicates(
     df: "DataFrame",
     columns: Iterable[str],
     version: str = "v1",
     repartition: bool = True,
+    max_distinct_keys: int | None = None,
 ) -> "DataFrame":
-    """witchhat.drop_duplicates applied per partition, buffered so it sees a whole
-    partition (not just one Arrow batch) at a time.
+    """witchhat.drop_duplicates applied per partition, streaming: each incoming
+    Arrow batch is hashed and filtered against a running per-partition index as it
+    arrives, rather than first buffering the whole partition into one
+    `RecordBatch`.
 
     `repartition=True` (the default) calls `df.repartition(*columns)` first.
     Without it, two duplicate rows that Spark happened to place in different
@@ -246,17 +300,35 @@ def drop_duplicates(
     `columns` guarantees exactly that. Pass `repartition=False` only when `df` is
     already known to be partitioned that way (e.g. right after another call in
     this module repartitioned by the same columns), to skip a redundant shuffle.
+
+    Memory tracks the number of *distinct* keys seen in the partition so far, not
+    the partition's row count, since only the "seen" index (not raw row data)
+    persists across batches. `max_distinct_keys` (default `None`, unbounded) raises
+    `MemoryError` if a partition's distinct-key count would exceed it, rather than
+    letting an unexpectedly skewed key distribution grow without bound. When
+    `witchhat.metrics` is enabled, one event is emitted per partition (matching
+    every other partition-coordinating function here), with `distinct_keys` and
+    `batches_in` added alongside the usual `rows_in`/`rows_out`.
     """
     columns = list(columns)
     if repartition:
         df = df.repartition(*columns)
 
     def process(batches: Iterator[pa.RecordBatch]) -> Iterator[pa.RecordBatch]:
-        batches = list(batches)
-        if not batches:
+        stats = {"batches_in": 0, "rows_in": 0, "rows_out": 0, "distinct_keys": 0}
+        if not metrics.is_enabled():
+            yield from _drop_duplicates_stream(
+                batches, columns, version, max_distinct_keys, stats
+            )
             return
-        whole_partition = pa.concat_batches(batches)
-        yield _witchhat.drop_duplicates(whole_partition, columns, version)
+        with metrics.measure("drop_duplicates", columns=columns, version=version) as event:
+            yield from _drop_duplicates_stream(
+                batches, columns, version, max_distinct_keys, stats
+            )
+            event["rows_in"] = stats["rows_in"]
+            event["rows_out"] = stats["rows_out"]
+            event["distinct_keys"] = stats["distinct_keys"]
+            event["batches_in"] = stats["batches_in"]
 
     return map_in_arrow(df, process, df.schema)
 
@@ -302,15 +374,141 @@ def _aggregate_output_schema(df: "DataFrame", group_by: list[str], aggregations:
     return StructType(fields)
 
 
+def _aggregate_merge_plan(
+    aggregations: list[tuple[str, str, str]],
+) -> tuple[list[tuple[str, str, str]], dict[str, str], list[tuple[str, str, Any]]]:
+    """Splits each requested `(column, func, alias)` into what to actually ask the
+    Rust kernel for per batch (`batch_aggregations`), how to combine two batches'
+    partial results for a given internal column (`internal_merge_kind`: `"sum"`,
+    `"min"` or `"max"`), and how to compute each final output column from the fully
+    merged per-group state (`final_plan`).
+
+    `"mean"`/`"avg"` cannot be merged directly (the mean of two batches' means is
+    not the mean of the whole, unless every batch had the same row count): it is
+    requested as a `"sum"` plus a `"count"` per batch instead, summed separately
+    across batches, and divided into a mean only once, after every batch has been
+    folded in. This is the same maths `witchhat.aggregate` itself uses in one
+    shot, just spread across batches.
+    """
+    batch_aggregations: list[tuple[str, str, str]] = []
+    internal_merge_kind: dict[str, str] = {}
+    final_plan: list[tuple[str, str, Any]] = []
+    for column, func, alias in aggregations:
+        if func in ("count", "sum"):
+            batch_aggregations.append((column, func, alias))
+            internal_merge_kind[alias] = "sum"
+            final_plan.append((alias, "direct", alias))
+        elif func in ("mean", "avg"):
+            sum_key, count_key = f"__{alias}__sum", f"__{alias}__count"
+            batch_aggregations.append((column, "sum", sum_key))
+            batch_aggregations.append((column, "count", count_key))
+            internal_merge_kind[sum_key] = "sum"
+            internal_merge_kind[count_key] = "sum"
+            final_plan.append((alias, "mean", (sum_key, count_key)))
+        elif func in ("min", "max"):
+            batch_aggregations.append((column, func, alias))
+            internal_merge_kind[alias] = func
+            final_plan.append((alias, "direct", alias))
+        else:
+            raise ValueError(f"unknown aggregate function {func!r}")
+    return batch_aggregations, internal_merge_kind, final_plan
+
+
+def _aggregate_stream(
+    batches: Iterator[pa.RecordBatch],
+    group_by: list[str],
+    aggregations: list[tuple[str, str, str]],
+    out_arrow_schema: pa.Schema,
+    stats: dict[str, int],
+) -> Iterator[pa.RecordBatch]:
+    batch_aggregations, internal_merge_kind, final_plan = _aggregate_merge_plan(aggregations)
+    internal_aliases = list(internal_merge_kind)
+    # {group-key tuple: {internal alias: merged value}}. Only ever holds one entry
+    # per *distinct* group and one scalar per requested reduction, not raw row
+    # data, so memory tracks group cardinality, not row count.
+    state: dict[tuple, dict[str, Any]] = {}
+
+    for batch in batches:
+        stats["batches_in"] += 1
+        n = batch.num_rows
+        if n == 0:
+            continue
+        stats["rows_in"] += n
+        partial = _raw_aggregate(batch, group_by, batch_aggregations)
+        group_columns = [partial.column(name).to_pylist() for name in group_by]
+        internal_columns = {
+            alias: partial.column(alias).to_pylist() for alias in internal_aliases
+        }
+        for i in range(partial.num_rows):
+            key = tuple(col[i] for col in group_columns)
+            entry = state.setdefault(key, {})
+            for alias in internal_aliases:
+                val = internal_columns[alias][i]
+                if val is None:
+                    continue
+                if alias not in entry:
+                    entry[alias] = val
+                    continue
+                kind = internal_merge_kind[alias]
+                if kind == "sum":
+                    entry[alias] += val
+                elif kind == "min":
+                    entry[alias] = min(entry[alias], val)
+                else:
+                    entry[alias] = max(entry[alias], val)
+
+    stats["distinct_groups"] = len(state)
+    if not state:
+        return
+
+    group_out: dict[str, list] = {name: [] for name in group_by}
+    agg_out: dict[str, list] = {alias: [] for alias, _, _ in final_plan}
+    for key, entry in state.items():
+        for name, value in zip(group_by, key):
+            group_out[name].append(value)
+        for alias, kind, payload in final_plan:
+            if kind == "direct":
+                agg_out[alias].append(entry.get(payload))
+            else:  # "mean"
+                sum_key, count_key = payload
+                total_sum = entry.get(sum_key)
+                total_count = entry.get(count_key, 0)
+                if total_sum is None or not total_count:
+                    agg_out[alias].append(None)
+                else:
+                    mean = total_sum / total_count
+                    field = out_arrow_schema.field(alias)
+                    if pa.types.is_decimal(field.type):
+                        # Python's Decimal division uses the ambient context's
+                        # precision, which does not automatically match the
+                        # output field's declared scale the way
+                        # witchhat.aggregate's own truncating mantissa division
+                        # does; quantize explicitly so pa.array below does not
+                        # reject it.
+                        mean = mean.quantize(Decimal(1).scaleb(-field.type.scale))
+                    agg_out[alias].append(mean)
+
+    arrays = []
+    for field in out_arrow_schema:
+        values = group_out[field.name] if field.name in group_out else agg_out[field.name]
+        arrays.append(pa.array(values, type=field.type))
+    result = pa.RecordBatch.from_arrays(arrays, schema=out_arrow_schema)
+    stats["rows_out"] = result.num_rows
+    yield result
+
+
 def aggregate(
     df: "DataFrame",
     group_by: list[str],
     aggregations: list[tuple[str, str, str]],
     repartition: bool = True,
 ) -> "DataFrame":
-    """witchhat.aggregate applied per partition, buffered so it sees a whole
-    partition at a time, correct for the whole DataFrame only when every row of a
-    given `group_by` key is in the same partition.
+    """witchhat.aggregate applied per partition, streaming: each incoming Arrow
+    batch is reduced independently, and only a per-group running merge state (one
+    partial reduction per distinct group, not raw row data) persists across
+    batches, rather than first buffering the whole partition into one
+    `RecordBatch`. Correct for the whole DataFrame only when every row of a given
+    `group_by` key is in the same partition.
 
     `repartition=True` (the default) calls `df.repartition(*group_by)` first:
     Spark hash-partitions by key, so every row sharing a `group_by` value lands in
@@ -324,6 +522,14 @@ def aggregate(
     arrange, and silently returning a partial answer under `repartition=False`
     would be worse than refusing outright.
 
+    Memory tracks the number of *distinct groups* in the partition, not its row
+    count: streaming still buffers one merge state per group (a high-cardinality
+    `group_by` does not benefit from streaming the way `drop_duplicates` does),
+    but never a whole batch's raw rows. When `witchhat.metrics` is enabled, one
+    event is emitted per partition (matching every other partition-coordinating
+    function here), with `distinct_groups` and `batches_in` added alongside the
+    usual `rows_in`/`rows_out`.
+
     Raises
     ------
     ValueError
@@ -336,16 +542,30 @@ def aggregate(
             "arrange safely. Use df.coalesce(1) and witchhat.aggregate directly "
             "inside your own mapInArrow call if you specifically need that."
         )
-    out_schema = _aggregate_output_schema(df, list(group_by), list(aggregations))
+    group_by = list(group_by)
+    aggregations = list(aggregations)
+    out_schema = _aggregate_output_schema(df, group_by, aggregations)
+    out_arrow_schema = to_arrow_schema(out_schema)
     if repartition:
         df = df.repartition(*group_by)
 
     def process(batches: Iterator[pa.RecordBatch]) -> Iterator[pa.RecordBatch]:
-        batches = list(batches)
-        if not batches:
+        stats = {"batches_in": 0, "rows_in": 0, "rows_out": 0, "distinct_groups": 0}
+        if not metrics.is_enabled():
+            yield from _aggregate_stream(
+                batches, group_by, aggregations, out_arrow_schema, stats
+            )
             return
-        whole_partition = pa.concat_batches(batches)
-        yield _witchhat.aggregate(whole_partition, list(group_by), list(aggregations))
+        with metrics.measure(
+            "aggregate", group_by=group_by, aggregation_count=len(aggregations)
+        ) as event:
+            yield from _aggregate_stream(
+                batches, group_by, aggregations, out_arrow_schema, stats
+            )
+            event["rows_in"] = stats["rows_in"]
+            event["rows_out"] = stats["rows_out"]
+            event["distinct_groups"] = stats["distinct_groups"]
+            event["batches_in"] = stats["batches_in"]
 
     return map_in_arrow(df, process, out_schema)
 

@@ -4,14 +4,41 @@
 //! Built directly on [`crate::hash`] and [`crate::validate`] rather than adding a new
 //! comparison algorithm: schema agreement is [`validate_schema`], row-set agreement is
 //! [`table_fingerprint`] over a shared column order. See [`check_equivalence`].
+//!
+//! [`EquivalenceMode::Fast`] (the default) is the fingerprint check just described: a
+//! `u64` collision between two genuinely different row sets is possible, however
+//! unlikely, so this is strong evidence for a human or a CI job to interpret, not a
+//! proof. [`EquivalenceMode::Exact`] additionally sorts both sides' rows through
+//! [`arrow_row::RowConverter`] (the same exact, byte-comparable format
+//! [`mod@crate::join`]/[`mod@crate::aggregate`]/[`mod@crate::dedup`] use) and compares
+//! them element-wise, a
+//! genuine proof of row-set equality with no collision caveat, at the cost of sorting
+//! both sides instead of one linear pass. Use `Exact` when a check must be relied on,
+//! e.g. gating a migration; `Fast` is enough for routine diagnostics.
 
 use std::sync::Arc;
 
-use arrow_array::RecordBatch;
+use arrow_array::{Array, ArrayRef, RecordBatch};
+use arrow_row::{OwnedRow, RowConverter, SortField};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::hash::{HashVersion, hash_batch, table_fingerprint};
 use crate::validate::{SchemaDiff, ValidateSchemaOptions, validate_schema};
+
+/// How thoroughly [`check_equivalence`] proves two batches hold the same rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EquivalenceMode {
+    /// Fingerprint only (the historical, and still default, behaviour): a `u64`
+    /// collision between two different row sets is possible, so a match here is
+    /// strong evidence, not proof. See [`crate::hash::table_fingerprint`].
+    #[default]
+    Fast,
+    /// Fingerprint, plus a genuine sort-and-compare over
+    /// [`arrow_row::RowConverter`]'s exact, byte-comparable row format: no collision
+    /// caveat, at the cost of sorting both sides. Populates
+    /// [`EquivalenceReport::rows_exactly_match`].
+    Exact,
+}
 
 /// Controls how [`check_equivalence`] compares two batches.
 #[derive(Debug, Clone, Default)]
@@ -27,6 +54,8 @@ pub struct EquivalenceOptions {
     pub hash_version: HashVersion,
     /// Passed through to [`validate_schema`] for the schema half of the comparison.
     pub schema_options: ValidateSchemaOptions,
+    /// `Fast` (default) or `Exact`; see [`EquivalenceMode`].
+    pub mode: EquivalenceMode,
 }
 
 /// The result of comparing `actual` against `expected`.
@@ -44,11 +73,17 @@ pub struct EquivalenceReport {
     pub table_fingerprint_expected: u64,
     /// Whether the two table fingerprints matched.
     pub fingerprints_match: bool,
+    /// Whether the sorted rows compared exactly equal, column by column, with no
+    /// fingerprint-collision caveat. `None` when `options.mode` was
+    /// [`EquivalenceMode::Fast`] (not computed); `Some(_)` under
+    /// [`EquivalenceMode::Exact`].
+    pub rows_exactly_match: Option<bool>,
 }
 
 impl EquivalenceReport {
     /// Whether `actual` and `expected` are equivalent: the schema diff is empty, row
-    /// counts match, and the table fingerprints match.
+    /// counts match, the table fingerprints match, and (under
+    /// [`EquivalenceMode::Exact`]) the sorted rows compared exactly equal too.
     ///
     /// Deliberately stricter than [`SchemaDiff::is_breaking`]: an equivalence check
     /// has no notion of "additive change is fine", since the whole point is asking
@@ -59,7 +94,69 @@ impl EquivalenceReport {
         self.schema_diff.is_empty()
             && self.row_count_actual == self.row_count_expected
             && self.fingerprints_match
+            && self.rows_exactly_match.unwrap_or(true)
     }
+}
+
+fn resolve_columns(batch: &RecordBatch, names: &[&str]) -> Result<Vec<ArrayRef>> {
+    names
+        .iter()
+        .map(|name| {
+            batch
+                .schema()
+                .index_of(name)
+                .map(|idx| Arc::clone(batch.column(idx)))
+                .map_err(|_| Error::unknown_column(*name))
+        })
+        .collect()
+}
+
+/// Sorts `actual` and `expected`'s rows over `columns` through the same
+/// `arrow_row::RowConverter` and compares them element-wise. `false` (not an error) if
+/// the two sides disagree on row count or on a compared column's type, since both are
+/// themselves a form of inequality, already visible in `EquivalenceReport::schema_diff`
+/// and `row_count_actual`/`row_count_expected`, not a reason to refuse an answer here.
+fn rows_exactly_equal(
+    actual: &RecordBatch,
+    expected: &RecordBatch,
+    columns: &[&str],
+) -> Result<bool> {
+    if actual.num_rows() != expected.num_rows() {
+        return Ok(false);
+    }
+
+    let actual_columns = resolve_columns(actual, columns)?;
+    let expected_columns = resolve_columns(expected, columns)?;
+    if actual_columns
+        .iter()
+        .zip(&expected_columns)
+        .any(|(a, e)| a.data_type() != e.data_type())
+    {
+        return Ok(false);
+    }
+
+    let fields: Vec<SortField> = actual_columns
+        .iter()
+        .map(|c| SortField::new(c.data_type().clone()))
+        .collect();
+    let converter = RowConverter::new(fields).map_err(|e| Error::config(e.to_string()))?;
+
+    let mut actual_rows: Vec<OwnedRow> = converter
+        .convert_columns(&actual_columns)
+        .map_err(|e| Error::config(e.to_string()))?
+        .iter()
+        .map(|r| r.owned())
+        .collect();
+    let mut expected_rows: Vec<OwnedRow> = converter
+        .convert_columns(&expected_columns)
+        .map_err(|e| Error::config(e.to_string()))?
+        .iter()
+        .map(|r| r.owned())
+        .collect();
+    actual_rows.sort();
+    expected_rows.sort();
+
+    Ok(actual_rows == expected_rows)
 }
 
 /// Compares `actual` against `expected`: same schema, same row count, same rows
@@ -73,6 +170,11 @@ impl EquivalenceReport {
 /// `Int32` `5` and an `Int64` `5` are not the same fingerprint. Pre-cast one side if
 /// that particular difference should not matter for a given comparison.
 ///
+/// Under [`EquivalenceMode::Exact`] (`options.mode`), also sorts both sides' rows
+/// through `arrow_row::RowConverter` and compares them element-wise, populating
+/// [`EquivalenceReport::rows_exactly_match`] with a real proof of row-set equality
+/// rather than the fingerprint's collision-caveated evidence.
+///
 /// # Errors
 ///
 /// Whatever [`hash_batch`] returns: [`crate::Error::UnknownColumn`] if
@@ -83,7 +185,7 @@ impl EquivalenceReport {
 /// # Panics
 ///
 /// Does not panic. Not async; runs on the calling thread in time linear in the two
-/// batches' sizes, with no I/O.
+/// batches' sizes under `Fast` (`Exact` additionally sorts both sides), with no I/O.
 ///
 /// # Examples
 ///
@@ -132,6 +234,11 @@ pub fn check_equivalence(
     let table_fingerprint_actual = table_fingerprint(&actual_hashes, options.hash_version);
     let table_fingerprint_expected = table_fingerprint(&expected_hashes, options.hash_version);
 
+    let rows_exactly_match = match options.mode {
+        EquivalenceMode::Fast => None,
+        EquivalenceMode::Exact => Some(rows_exactly_equal(actual, expected, &columns)?),
+    };
+
     Ok(EquivalenceReport {
         schema_diff,
         row_count_actual: actual.num_rows(),
@@ -139,6 +246,7 @@ pub fn check_equivalence(
         table_fingerprint_actual,
         table_fingerprint_expected,
         fingerprints_match: table_fingerprint_actual == table_fingerprint_expected,
+        rows_exactly_match,
     })
 }
 
@@ -247,5 +355,60 @@ mod tests {
         };
         let report = check_equivalence(&a, &b, options).unwrap();
         assert!(report.fingerprints_match); // only "id" was compared, and it matches
+    }
+
+    #[test]
+    fn fast_mode_leaves_rows_exactly_match_unset() {
+        let s = id_name_schema();
+        let a = batch(s.clone(), vec![1, 2], vec!["a", "b"]);
+        let b = batch(s, vec![1, 2], vec!["a", "b"]);
+        let report = check_equivalence(&a, &b, EquivalenceOptions::default()).unwrap();
+        assert_eq!(report.rows_exactly_match, None);
+        assert!(report.is_equivalent()); // Fast mode: exactness not required
+    }
+
+    #[test]
+    fn exact_mode_confirms_reordered_identical_rows() {
+        let s = id_name_schema();
+        let a = batch(s.clone(), vec![2, 1], vec!["b", "a"]);
+        let b = batch(s, vec![1, 2], vec!["a", "b"]);
+        let options = EquivalenceOptions {
+            mode: EquivalenceMode::Exact,
+            ..Default::default()
+        };
+        let report = check_equivalence(&a, &b, options).unwrap();
+        assert_eq!(report.rows_exactly_match, Some(true));
+        assert!(report.is_equivalent());
+    }
+
+    #[test]
+    fn exact_mode_catches_what_fingerprints_alone_would_not_distinguish() {
+        // Same fingerprint-relevant facts (2 rows, schema matches) but genuinely
+        // different row-level content than the fingerprint-only report would need to
+        // prove; exact mode sorts and compares every value, not just a folded hash.
+        let s = id_name_schema();
+        let a = batch(s.clone(), vec![1, 2], vec!["a", "b"]);
+        let b = batch(s, vec![1, 2], vec!["a", "z"]);
+        let options = EquivalenceOptions {
+            mode: EquivalenceMode::Exact,
+            ..Default::default()
+        };
+        let report = check_equivalence(&a, &b, options).unwrap();
+        assert_eq!(report.rows_exactly_match, Some(false));
+        assert!(!report.is_equivalent());
+        assert!(!report.fingerprints_match); // this case also differs by fingerprint
+    }
+
+    #[test]
+    fn exact_mode_false_on_row_count_mismatch_without_erroring() {
+        let s = id_name_schema();
+        let a = batch(s.clone(), vec![1], vec!["a"]);
+        let b = batch(s, vec![1, 2], vec!["a", "b"]);
+        let options = EquivalenceOptions {
+            mode: EquivalenceMode::Exact,
+            ..Default::default()
+        };
+        let report = check_equivalence(&a, &b, options).unwrap();
+        assert_eq!(report.rows_exactly_match, Some(false));
     }
 }

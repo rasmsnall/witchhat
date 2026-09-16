@@ -40,7 +40,7 @@ pub use aggregate::{AggFunc, Aggregation, aggregate};
 pub use clean::{CleanRule, CleanupVersion, apply_rules, clean_with_preset};
 pub use cpu::{CpuFeatures, features};
 pub use dedup::drop_duplicates;
-pub use equivalence::{EquivalenceOptions, EquivalenceReport, check_equivalence};
+pub use equivalence::{EquivalenceMode, EquivalenceOptions, EquivalenceReport, check_equivalence};
 pub use error::{Error, Result};
 pub use hash::{HashVersion, hash_batch, hash_batch_all_columns, table_fingerprint};
 pub use join::{JoinType, join, join_null_safe};

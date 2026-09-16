@@ -5,6 +5,28 @@
 //! ([`preset`], [`clean_with_preset`]). Only the presets are versioned
 //! ([`CleanupVersion`]): a caller's own regex is the caller's own algorithm, and
 //! witchhat has no more business versioning it than it does versioning their SQL.
+//!
+//! **The `regex` crate's dialect is not Spark's (Java's) regex dialect.** A pattern
+//! written for `pyspark.sql.functions.regexp_replace`, or copied from a Spark SQL
+//! `REGEXP_REPLACE`/`RLIKE` expression, is not guaranteed to compile here, let alone
+//! match the same way. Concretely unsupported, not just different: lookahead
+//! (`(?=...)`, `(?!...)`) and lookbehind (`(?<=...)`, `(?<!...)`), and backreferences
+//! (`\1`, `\k<name>` inside the *pattern* itself, as opposed to `$1` in a
+//! *replacement*, which `regex` does support). [`CleanRule::new`] rejects a pattern
+//! using either as an [`Error::Config`] at compile time, not a runtime surprise, but the
+//! rejection message is `regex`'s own compiler diagnostic, not a witchhat-authored
+//! explanation of the Java-versus-Rust gap; this module doc is that explanation.
+//! Supported and equivalent in both dialects: character classes, quantifiers
+//! (`*`/`+`/`?`/`{m,n}`, greedy and lazy), anchors (`^`/`$`), alternation (`|`),
+//! non-capturing/capturing/named groups, and Unicode character properties (`\p{...}`).
+//! When a Spark-side pattern relies on lookaround or a backreference, the fix is not a
+//! witchhat setting: rewrite the pattern in `regex`-compatible terms (often possible for
+//! a fixed-width lookaround) or perform that specific cleanup step in Spark itself
+//! before/after the witchhat-handled ones. There is no equivalence test in this crate
+//! that checks a given pattern's behavior against Spark's actual regex engine; validate
+//! any ported pattern against real Spark output before relying on it, the same way
+//! [`crate::equivalence::check_equivalence`] is meant to be used for the rest of a
+//! pipeline.
 
 use std::sync::Arc;
 
@@ -25,12 +47,16 @@ pub struct CleanRule {
 impl CleanRule {
     /// Compiles a rule from a regular expression and its replacement text.
     ///
-    /// `replacement` follows the `regex` crate's replacement syntax: `$1`, `${name}`
-    /// and so on refer to capture groups, and a literal `$` is written `$$`.
+    /// `pattern` follows the `regex` crate's syntax, which is not Spark/Java's: no
+    /// lookahead, no lookbehind, no backreferences in the pattern (see this module's
+    /// top-level docs for the full explanation and what to do instead). `replacement`
+    /// follows the `regex` crate's replacement syntax: `$1`, `${name}` and so on refer
+    /// to capture groups, and a literal `$` is written `$$`.
     ///
     /// # Errors
     ///
-    /// [`Error::Config`] if `pattern` does not compile.
+    /// [`Error::Config`] if `pattern` does not compile, including a `pattern` that uses
+    /// lookaround or a backreference.
     pub fn new(pattern: &str, replacement: impl Into<Arc<str>>) -> Result<Self> {
         Ok(Self {
             pattern: Regex::new(pattern).map_err(Error::config)?,
@@ -240,5 +266,15 @@ mod tests {
     #[test]
     fn invalid_pattern_errors() {
         assert!(CleanRule::new("(unclosed", "").is_err());
+    }
+
+    #[test]
+    fn lookaround_and_backreferences_are_rejected_not_silently_different() {
+        // Patterns a Spark/Java regexp_replace caller might reasonably port over, but
+        // that this crate's `regex` dialect does not support at all: better a compile
+        // error here than a pattern that silently matches something else.
+        assert!(CleanRule::new(r"foo(?=bar)", "").is_err()); // lookahead
+        assert!(CleanRule::new(r"(?<=foo)bar", "").is_err()); // lookbehind
+        assert!(CleanRule::new(r"(\w+)\s\1", "").is_err()); // backreference in pattern
     }
 }
